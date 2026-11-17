@@ -3322,3 +3322,6 @@ export class CodeGraph {
 
 // Default export
 export default CodeGraph;
+
+// Shared-base / worktree overlay spike; extraction stays behind engine().
+export * from './overlay';

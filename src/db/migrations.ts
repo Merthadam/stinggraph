@@ -5,12 +5,13 @@
  */
 
 import { SqliteDatabase } from './sqlite-adapter';
+import { recomputeStableKeys } from '../overlay/stable-keys';
 import { referenceNameTail, MEMBER_TAIL_SQL, MODULE_PARKED_SQL } from './reference-tail';
 
 /**
  * Current schema version
  */
-export const CURRENT_SCHEMA_VERSION = 16;
+export const CURRENT_SCHEMA_VERSION = 17;
 
 /**
  * Migration definition
@@ -313,6 +314,18 @@ const migrations: Migration[] = [
       db.exec(`
         CREATE INDEX IF NOT EXISTS idx_unresolved_failed_module_member ON unresolved_refs(status, ${MEMBER_TAIL_SQL}) WHERE ${MODULE_PARKED_SQL};
       `);
+    },
+  },
+  {
+    version: 17,
+    description: 'Stable symbol keys and git blob identity for shared base indexes',
+    up: (db) => {
+      const hasColumn = (table: string, column: string) =>
+        db.prepare(`PRAGMA table_info(${table})`).all().some((row) => row.name === column);
+      if (!hasColumn('nodes', 'stable_key')) db.exec('ALTER TABLE nodes ADD COLUMN stable_key TEXT');
+      if (!hasColumn('files', 'git_blob_id')) db.exec('ALTER TABLE files ADD COLUMN git_blob_id TEXT');
+      recomputeStableKeys(db);
+      db.exec('CREATE INDEX IF NOT EXISTS idx_nodes_stable_key ON nodes(stable_key)');
     },
   },
 ];

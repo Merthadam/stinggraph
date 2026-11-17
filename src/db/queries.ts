@@ -5,6 +5,7 @@
  */
 
 import { SqliteDatabase, SqliteStatement } from './sqlite-adapter';
+import { recomputeStableKeysAfterWrite } from '../overlay/stable-keys';
 import {
   Node,
   Edge,
@@ -195,7 +196,7 @@ interface UnresolvedRefRow {
 /**
  * Convert database row to Node object
  */
-function rowToNode(row: NodeRow): Node {
+export function rowToNode(row: NodeRow): Node {
   return {
     id: row.id,
     kind: row.kind as NodeKind,
@@ -774,6 +775,8 @@ export class QueryBuilder {
       updatedAt: node.updatedAt ?? Date.now(),
     });
 
+    recomputeStableKeysAfterWrite(this.db, [node.filePath]);
+
     // Segment vocabulary rides the same write path (and transaction) so it can
     // never drift ahead of the nodes it describes. Deletes intentionally leave
     // orphans behind — vocab rows are proposals re-verified against nodes
@@ -867,6 +870,7 @@ export class QueryBuilder {
         '(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)',
         rows
       );
+      recomputeStableKeysAfterWrite(this.db, nodes.map((node) => node.filePath));
       this.runBatched(
         'insertNameSegments',
         'INSERT OR IGNORE INTO name_segment_vocab (segment, name) VALUES ',
@@ -980,6 +984,7 @@ export class QueryBuilder {
       return;
     }
 
+    const previousFile = this.db.prepare('SELECT file_path FROM nodes WHERE id = ?').get(node.id)?.file_path as string | undefined;
     this.stmts.updateNode.run({
       id: node.id,
       kind: node.kind,
@@ -1004,6 +1009,8 @@ export class QueryBuilder {
       updatedAt: node.updatedAt ?? Date.now(),
     });
 
+    recomputeStableKeysAfterWrite(this.db, previousFile ? [previousFile, node.filePath] : [node.filePath]);
+
     // updateNode is a second real write path to `nodes` — framework
     // post-extract passes rewrite names through it (NestJS route prefixing),
     // and a renamed node's new name must reach the segment vocabulary just
@@ -1024,7 +1031,9 @@ export class QueryBuilder {
     }
     // Invalidate cache
     this.nodeCache.delete(id);
+    const previousFile = this.db.prepare('SELECT file_path FROM nodes WHERE id = ?').get(id)?.file_path as string | undefined;
     this.stmts.deleteNode.run(id);
+    if (previousFile) recomputeStableKeysAfterWrite(this.db, [previousFile]);
   }
 
   /**
@@ -4030,6 +4039,8 @@ export class QueryBuilder {
         INSERT INTO files (path, content_hash, language, size, modified_at, indexed_at, node_count, errors, generated)
         VALUES (@path, @contentHash, @language, @size, @modifiedAt, @indexedAt, @nodeCount, @errors, @generated)
         ON CONFLICT(path) DO UPDATE SET
+          -- A git blob stamp is only valid for the content it was stamped on.
+          git_blob_id = CASE WHEN content_hash = @contentHash THEN git_blob_id ELSE NULL END,
           content_hash = @contentHash,
           language = @language,
           size = @size,

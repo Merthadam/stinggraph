@@ -20,3 +20,6 @@ export {
   reopenReferencesThroughRetargetedModules,
 } from './resolution/module-importers';
 export { FileWatcher } from './sync/watcher';
+
+export { extractOverlayFile, detectOverlayFrameworks, resolveOverlayScope } from './overlay/extract-engine';
+export { resolveOverlayMerged } from './overlay/merged-resolver';

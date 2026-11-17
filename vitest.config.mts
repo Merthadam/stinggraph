@@ -79,7 +79,7 @@ export default defineConfig({
           // transform: see src/lazy-engine.ts.
           alias: [
             {
-              find: /^\.\/lazy-engine$/,
+              find: /^\.\.?\/lazy-engine$/, // ../lazy-engine: src/overlay/extract.ts
               replacement: fileURLToPath(new URL('./__tests__/lazy-engine-eager.ts', import.meta.url)),
             },
             {

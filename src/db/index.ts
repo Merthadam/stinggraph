@@ -9,6 +9,7 @@ import * as fs from 'fs';
 import * as path from 'path';
 import { SchemaVersion } from '../types';
 import { runMigrations, getCurrentVersion, CURRENT_SCHEMA_VERSION } from './migrations';
+import { recomputeStableKeys } from '../overlay/stable-keys';
 import { getCodeGraphDir, statInode } from '../directory';
 import { toDatabaseOpenError } from './open-error';
 
@@ -345,6 +346,7 @@ export class DatabaseConnection {
       this.db.exec(m[0]);
       await new Promise((resolve) => setImmediate(resolve));
     }
+    recomputeStableKeys(this.db);
     await this.endBulkEdgeLoad();
   }
 

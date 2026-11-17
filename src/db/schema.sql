@@ -38,7 +38,8 @@ CREATE TABLE IF NOT EXISTS nodes (
     decorators TEXT, -- JSON array
     type_parameters TEXT, -- JSON array
     return_type TEXT, -- normalized return/result type name (e.g. C++ method return, for receiver-type inference)
-    updated_at INTEGER NOT NULL
+    updated_at INTEGER NOT NULL,
+    stable_key TEXT -- file_path#kind#qualified_name[#ordinal]; last so fresh and migrated (v17 ALTER) bases share column order
 );
 
 -- Edges: Relationships between nodes
@@ -73,7 +74,8 @@ CREATE TABLE IF NOT EXISTS files (
     indexed_at INTEGER NOT NULL,
     node_count INTEGER DEFAULT 0,
     errors TEXT, -- JSON array
-    generated INTEGER NOT NULL DEFAULT 0
+    generated INTEGER NOT NULL DEFAULT 0,
+    git_blob_id TEXT -- git blob of the indexed content when it came from git; NULL otherwise (v17)
 );
 
 -- Unresolved References: References that need resolution after full indexing.
@@ -105,6 +107,7 @@ CREATE TABLE IF NOT EXISTS unresolved_refs (
 -- =============================================================================
 
 -- Node indexes
+CREATE INDEX IF NOT EXISTS idx_nodes_stable_key ON nodes(stable_key);
 CREATE INDEX IF NOT EXISTS idx_nodes_kind ON nodes(kind, file_path, start_line, id);
 CREATE INDEX IF NOT EXISTS idx_nodes_name ON nodes(name);
 CREATE INDEX IF NOT EXISTS idx_nodes_qualified_name ON nodes(qualified_name);

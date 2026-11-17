@@ -57,7 +57,9 @@ describe('node rows', () => {
     expect(asObjects.getNodeById(full.id)).toStrictEqual(asArrays.getNodeById(full.id));
     expect(asObjects.getNodeById(bare.id)).toStrictEqual(asArrays.getNodeById(bare.id));
     expect(asObjects.getNodesByFile('src/job.ts')).toStrictEqual(asArrays.getNodesByFile('src/job.ts'));
-    const stored = Object.keys(connection.prepare('SELECT * FROM nodes LIMIT 1').get() as object);
+    // stable_key (v17) is derived by the DB from file/kind/qualified name, not a Node field.
+    const stored = Object.keys(connection.prepare('SELECT * FROM nodes LIMIT 1').get() as object)
+      .filter((column) => column !== 'stable_key');
     expect(stored.length).toBe(Object.keys(full).length);
   });
 });

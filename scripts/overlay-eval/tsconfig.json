@@ -1,0 +1,4 @@
+{
+  "//": "The root tsconfig maps web-tree-sitter to a .d.ts, which tsx then resolves at runtime; these scripts load dist/ and need the real package.",
+  "compilerOptions": { "target": "ES2022", "module": "commonjs", "esModuleInterop": true, "strict": true, "skipLibCheck": true }
+}
