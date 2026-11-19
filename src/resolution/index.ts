@@ -43,6 +43,7 @@ import { clearCFeatureVariantMemos } from './c-feature-variants';
 import { clearAmbientModuleMemos, ambientModuleDeclarations } from './ambient-modules';
 import { matchShopifyThemeFile } from './shopify-themes';
 import { isJsSuperCallLanguage, isJsSuperCallSite, matchJsSuperCall } from './js-super-calls';
+import { jsParamDefaultReceiver } from './js-param-defaults';
 import { CLASS_EXPRESSION_REF_LANGUAGES, isCommonJsExportedClass, isJsClassExpression, writtenIn, type ClassExpressionIndex } from './js-class-expressions';
 import { clearRubyConstantPathMemos, matchRubyConstantPathRef } from './ruby-constant-paths';
 import { resolveViaImport, resolvePhpImportedStaticCall, resolvePhpQualifiedClassRef, resolveTsQualifiedTypeRef, resolveJvmImport, extractImportMappings, extractReExports, CPP_COMPILE_DB_FILES, loadCppIncludeDirsFromCompileDB, loadCppIncludeDirsHeuristic, readCompileDbIncludeDirs, isPhpIncludePathRef, isCobolCopybookRef, isNixPathImportRef, isDartImportRef, isLuaRequireRef, isJsPathImportRef, isBoundToOutOfRepoImport, reachesAmbientModule, importBindingTail, clearImportResolverMemos, resolveImportPath, isExternalImport, pythonImportsInScope, ESM_IMPORT_LANGUAGES, jsModuleFile, pythonRootFingerprint, pythonReopenScope, pythonScriptModuleScope, pythonPackageImporters, moduleDefaultExport, isJsFamilyFile, isModuleBindingName } from './import-resolver';
@@ -1729,6 +1730,13 @@ export class ReferenceResolver {
     // its name alone (see ./js-super-calls).
     const superCall = matchJsSuperCall(ref, this.context);
     if (superCall !== undefined) return superCall;
+    // A TS/JS call on a parameter defaulting to another binding (`{ api =
+    // plansApi }`, then `api.create()`) runs on the default (./js-param-defaults).
+    const viaDefault = jsParamDefaultReceiver(ref, this.context);
+    if (viaDefault) {
+      const hit = this.resolveOneInner({ ...ref, referenceName: viaDefault });
+      if (hit) return { ...hit, original: ref };
+    }
 
     // A Kotlin call through a receiver chain (`engine.pump.drain()`) resolves
     // on the chain's declared type, or gets no edge when that type is a
