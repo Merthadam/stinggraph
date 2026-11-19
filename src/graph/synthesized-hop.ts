@@ -48,8 +48,12 @@ export function describeSynthesizedHop(edge: Edge | null | undefined): Synthesiz
       return hop(`callback via ${quoted(m.via, 'a registrar')}`);
     case 'http-client': {
       const request = `${String(m.method ?? 'GET')} ${String(m.href ?? '')}`.trim();
-      return hop(`HTTP ${request}`, " — the client's call onto its own route");
+      return hop(`HTTP ${request}`, m.tier === 'server→server' ? " — one service's call onto another's route" : " — the client's call onto its own route");
     }
+    case 'http-proxy':
+      return hop(`HTTP proxy ${String(m.method ?? '')} ${String(m.href ?? '')}`.trimEnd(), " — the gateway forwards the request onto the backend's route");
+    case 'mcp-tool':
+      return hop(`MCP tool ${quoted(m.tool, 'a tool')}`, " — the client's tool call onto the server's tool function");
     case 'queue-job':
       return hop(`queue job ${quoted(m.event, 'a job')}`, m.queue ? ` on \`${String(m.queue)}\`` : '');
     case 'event-bus': {

@@ -113,6 +113,9 @@ describe('describeSynthesizedHop', () => {
     [{ synthesizedBy: 'queue-job', event: 'send-email', queue: 'emails' }, 'queue job `send-email`', ' on `emails`'],
     [{ synthesizedBy: 'event-bus', channel: 'socket', event: 'chat', tier: 'client→server' }, 'socket message `chat`', ' → server'],
     [{ synthesizedBy: 'http-client', method: 'POST', href: '/api/users' }, 'HTTP POST /api/users', " — the client's call onto its own route"],
+    [{ synthesizedBy: 'http-client', method: 'GET', href: '/v1/x', tier: 'server→server' }, 'HTTP GET /v1/x', " — one service's call onto another's route"],
+    [{ synthesizedBy: 'http-proxy', method: 'POST', href: '/v1/plans' }, 'HTTP proxy POST /v1/plans', " — the gateway forwards the request onto the backend's route"],
+    [{ synthesizedBy: 'mcp-tool', tool: 'search_places' }, 'MCP tool `search_places`', " — the client's tool call onto the server's tool function"],
   ])('%o reads "%s"', (metadata, summary, detail) => {
     expect(describeSynthesizedHop(edge(metadata))).toEqual({ summary, detail, registeredAt: at });
   });

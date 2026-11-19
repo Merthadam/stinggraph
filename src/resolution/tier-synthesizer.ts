@@ -61,6 +61,7 @@ const HTTP_VERBS: ReadonlySet<string> = new Set(['GET', 'POST', 'PUT', 'PATCH', 
 
 export const TIER_CLIENT_TO_SERVER = 'client→server';
 export const TIER_SERVER_TO_CLIENT = 'server→client';
+export const TIER_SERVER_TO_SERVER = 'server→server';
 
 // =============================================================================
 // Source reading
@@ -259,6 +260,12 @@ interface FileFacts {
   readonly routeLines: Set<number>;
   /** Local names bound to an HTTP client instance, with their literal base URL when written. */
   clients: Map<string, { baseURL: string | null }>;
+  /**
+   * This file's functions that hand their first parameter to a client call as
+   * the URL — `function request(path) { return fetch(path, …) }` — with the
+   * method that call makes (null when computed). Filled by the HTTP scan.
+   */
+  wrappers: Map<string, { method: string | null; baseURL: string | null }>;
   /** The module's default export is a client instance. */
   defaultClient: { baseURL: string | null } | null;
   /** Local names bound to a named queue (`new Queue('email')`, `@InjectQueue('email') x`). */
@@ -318,6 +325,7 @@ function readFacts(ctx: ResolutionContext, file: string): FileFacts | null {
       return routeLines;
     },
     clients,
+    wrappers: new Map(),
     defaultClient,
     queues,
     socketServer: SOCKET_SERVER_FILE.test(safe),
@@ -387,7 +395,14 @@ interface HttpSite {
   column: number;
   /** The call as written, `fetch` / `api.get` — what the Steps walk must not also draw as an effect. */
   callee: string;
-  method: string;
+  /** Null when a wrapper computes it (`method: options.method || …`): any method one registration serves. */
+  method: string | null;
+  /**
+   * A page's same-origin call (`fetch('/api/x')`, no host, no base URL): it
+   * reaches the origin that served the page, so a path both a gateway's proxy
+   * and the backend behind it serve is the gateway's.
+   */
+  browser: boolean;
   segs: string[];
   /** The path began with a hole — a base URL — and matches a route by its tail. */
   suffix: boolean;
@@ -409,7 +424,7 @@ function httpRoutes(ctx: ResolutionContext): HttpRoute[] {
 }
 
 const PARAM_SEG = /^(?::|\{|\[|<|\*)|\?$/;
-const CATCH_ALL = /^(?:\*|\[\.\.\.|\{\*|:[\w$]+\*$|\{[\w$]+:\*\}|\*[\w$]*$)/;
+const CATCH_ALL = /^(?:\*|\[\.\.\.|\{\*|:[\w$]+\*$|\{[\w$]+:(?:\*|path)\}|\*[\w$]*$)/;
 
 /** How well the client's segments match a route's; null when they do not. A literal match beats a parameter's. */
 function scorePath(client: readonly string[], route: readonly string[]): number | null {
@@ -435,12 +450,15 @@ function scorePath(client: readonly string[], route: readonly string[]): number 
   return i === client.length ? score : null;
 }
 
-function matchHttp(site: HttpSite, routes: readonly HttpRoute[]): HttpRoute | null {
-  let best: HttpRoute | null = null;
+/**
+ * The routes a client call reaches: one route, or every method of the ONE
+ * registration a method-less call can mean; empty when the path is ambiguous.
+ */
+function matchHttp(site: HttpSite, routes: readonly HttpRoute[], proxies: ReadonlySet<string>): HttpRoute[] {
+  let best: HttpRoute[] = [];
   let bestScore = -1;
-  let tied = false;
   for (const r of routes) {
-    if (r.method !== 'ALL' && r.method !== 'ANY' && r.method !== site.method) continue;
+    if (site.method !== null && r.method !== 'ALL' && r.method !== 'ANY' && r.method !== site.method) continue;
     let score: number | null;
     if (site.suffix) {
       // A base URL hides a prefix the route may spell out (`${API}/users` for
@@ -452,12 +470,18 @@ function matchHttp(site: HttpSite, routes: readonly HttpRoute[]): HttpRoute | nu
     } else score = scorePath(site.segs, r.segs);
     if (score === null) continue;
     if (score > bestScore) {
-      best = r;
+      best = [r];
       bestScore = score;
-      tied = false;
-    } else if (score === bestScore) tied = true;
+    } else if (score === bestScore) best.push(r);
   }
-  return tied ? null : best;
+  if (best.length > 1 && site.browser) {
+    const viaGateway = best.filter((r) => proxies.has(r.node.id));
+    if (viaGateway.length > 0) best = viaGateway;
+  }
+  if (best.length <= 1) return best;
+  const first = best[0]!.node;
+  const oneRegistration = best.every((r) => r.node.filePath === first.filePath && r.node.startLine === first.startLine);
+  return site.method === null && oneRegistration ? best : [];
 }
 
 /**
@@ -528,6 +552,15 @@ function clientFor(
   return null;
 }
 
+/** The name of a function's first parameter, from its signature: `(path, body)`, `path =>`. */
+function firstParam(fn: Node): string | null {
+  const m = /^\s*(?:async\s+)?\(?\s*([A-Za-z_$][\w$]*)/.exec(fn.signature ?? '');
+  return m ? m[1]! : null;
+}
+
+/** An absolute URL (`https://host/x`, `//host/x`): not a same-origin call. */
+const ABSOLUTE_URL = /^(?:[a-z][a-z0-9+.-]*:)?\/\//i;
+
 function collectHttpSites(ctx: ResolutionContext, facts: FileFacts, sites: HttpSite[], cache: Map<string, FileFacts | null>): void {
   const { safe, lineOf } = facts;
   const add = (index: number, open: number, verb: string | null, baseURL: string | null): void => {
@@ -540,6 +573,7 @@ function collectHttpSites(ctx: ResolutionContext, facts: FileFacts, sites: HttpS
     if (!args || !args[0]) return;
     let first = args[0];
     let method = verb;
+    let computedMethod = false;
     // `axios({ url, method })`, `.request({ url, method })`, `ky(url, { method })`.
     if (first.trimStart().startsWith('{')) {
       const url = /\burl\s*:\s*/.exec(first);
@@ -547,13 +581,23 @@ function collectHttpSites(ctx: ResolutionContext, facts: FileFacts, sites: HttpS
       method = method ?? methodIn(first) ?? 'GET';
       first = first.slice(url.index + url[0].length);
     } else if (method === null) {
-      method = methodIn(args.slice(1).join(',')) ?? 'GET';
+      const options = args.slice(1).join(',');
+      method = methodIn(options);
+      computedMethod = method === null && /\bmethod\s*:/.test(options);
+      method = method ?? 'GET';
     }
     const literal = leadingString(first);
-    if (literal === null) return;
+    if (literal === null) {
+      // `function request(path) { … fetch(path, …) }`: its callers write the path.
+      if (fn.kind === 'function' && first.trim() === firstParam(fn)) {
+        facts.wrappers.set(fn.name, { method: computedMethod ? null : method, baseURL });
+      }
+      return;
+    }
     const path = clientPath(literal, baseURL);
     if (!path) return;
-    sites.push({ fn, file: facts.file, line, column: facts.columnOf(index), callee, method, segs: path.segs, suffix: path.suffix, display: path.display });
+    const browser = baseURL === null && !path.suffix && !ABSOLUTE_URL.test(literal);
+    sites.push({ fn, file: facts.file, line, column: facts.columnOf(index), callee, method, browser, segs: path.segs, suffix: path.suffix, display: path.display });
   };
 
   BARE_CLIENT_CALL.lastIndex = 0;
@@ -570,6 +614,246 @@ function collectHttpSites(ctx: ResolutionContext, facts: FileFacts, sites: HttpS
     if (!client) continue;
     const verb = m[2]!.replace(/^\$/, '').toUpperCase();
     add(m.index, m.index + m[0].length - 1, verb === 'REQUEST' ? null : verb, client.baseURL);
+  }
+}
+
+/**
+ * Calls of a project's own fetch wrapper with a literal path —
+ * `request('/v1/plans', body)` where `request` (defined in this file or
+ * imported from one) passes its first parameter to `fetch`. One level only: a
+ * wrapper of a wrapper is not followed. Runs after every file's HTTP scan, so
+ * each wrapper is known wherever it is defined.
+ */
+function collectWrapperSites(ctx: ResolutionContext, facts: FileFacts, names: RegExp, sites: HttpSite[], cache: Map<string, FileFacts | null>): void {
+  const { safe, lineOf } = facts;
+  names.lastIndex = 0;
+  let m: RegExpExecArray | null;
+  while ((m = names.exec(safe)) !== null) {
+    const name = m[1]!;
+    const imported = importedFacts(ctx, facts, name, cache);
+    const wrapper = imported
+      ? imported.isDefault ? undefined : imported.facts.wrappers.get(imported.exportedName)
+      : facts.wrappers.get(name);
+    if (!wrapper) continue;
+    const line = lineOf(m.index);
+    const fn = enclosingFn(facts.nodes, line);
+    if (!fn) continue;
+    const args = argumentsAt(safe, m.index + m[0].length - 1);
+    if (!args || !args[0]) continue;
+    const literal = leadingString(args[0]);
+    if (literal === null) continue;
+    const path = clientPath(literal, wrapper.baseURL);
+    if (!path) continue;
+    const browser = wrapper.baseURL === null && !path.suffix && !ABSOLUTE_URL.test(literal);
+    const method = methodIn(args.slice(1).join(',')) ?? wrapper.method;
+    sites.push({ fn, file: facts.file, line, column: facts.columnOf(m.index), callee: name, method, browser, segs: path.segs, suffix: path.suffix, display: path.display });
+  }
+}
+
+// -----------------------------------------------------------------------------
+// Python clients: httpx / requests / aiohttp
+// -----------------------------------------------------------------------------
+
+/**
+ * The Python string literal at the start of `text` (`'x'`, `"x"`, `f"{base}/x"`),
+ * f-string fields as HOLE; null for anything else.
+ */
+function pyStringAt(text: string): string | null {
+  const m = /^([rRbBfFuU]{0,2})(['"])/.exec(text.trim());
+  if (!m) return null;
+  const t = text.trim();
+  const isF = /f/i.test(m[1]!);
+  const q = m[2]!;
+  let out = '';
+  for (let i = m[0].length; i < t.length; i++) {
+    const ch = t[i]!;
+    if (ch === '\\') {
+      out += t[i + 1] ?? '';
+      i++;
+      continue;
+    }
+    if (ch === q) return out;
+    if (isF && ch === '{') {
+      if (t[i + 1] === '{') {
+        out += '{';
+        i++;
+        continue;
+      }
+      let depth = 0;
+      for (; i < t.length; i++) {
+        if (t[i] === '{') depth++;
+        else if (t[i] === '}' && --depth === 0) break;
+      }
+      out += HOLE;
+      continue;
+    }
+    if (isF && ch === '}' && t[i + 1] === '}') i++;
+    out += ch;
+  }
+  return null;
+}
+
+const PY_CLIENT_CTOR = /\b(?:httpx\s*\.\s*(?:Async)?Client|requests\s*\.\s*Session|aiohttp\s*\.\s*ClientSession)\s*\(/g;
+const PY_MODULE_CALL = /(?<![\w.])(httpx|requests)\s*\.\s*(get|post|put|patch|delete|head|options|request)\s*\(/g;
+const PY_MEMBER_CALL = /(?<![\w.])((?:self\s*\.\s*)?[A-Za-z_]\w*)\s*\.\s*(get|post|put|patch|delete|head|options|request|stream)\s*\(/g;
+const PY_HTTP_GATE = /\b(?:httpx|requests|aiohttp)\b/;
+
+/** Names a Python file binds to an HTTP client (`with httpx.AsyncClient(…) as client`, `self.http = requests.Session()`), with the base URL. */
+function pyClients(safe: string): Map<string, { baseURL: string | null }> {
+  const out = new Map<string, { baseURL: string | null }>();
+  PY_CLIENT_CTOR.lastIndex = 0;
+  let m: RegExpExecArray | null;
+  while ((m = PY_CLIENT_CTOR.exec(safe)) !== null) {
+    const open = m.index + m[0].length - 1;
+    const close = closeParen(safe, open);
+    if (close < 0) continue;
+    const args = safe.slice(open + 1, close);
+    const base = /\bbase_url\s*=\s*/.exec(args);
+    // A base URL read from config is still a prefix the path sits under: match by the tail.
+    const baseURL = base ? pyStringAt(args.slice(base.index + base[0].length)) ?? HOLE : null;
+    const assigned = /(?:^|[^\w.])(?:self\s*\.\s*)?([A-Za-z_]\w*)\s*=\s*(?:await\s+)?$/.exec(safe.slice(Math.max(0, m.index - 80), m.index));
+    const as = /^\s*as\s+([A-Za-z_]\w*)/.exec(safe.slice(close + 1, close + 80));
+    const name = as?.[1] ?? assigned?.[1];
+    if (name) out.set(name, { baseURL });
+  }
+  return out;
+}
+
+function collectPythonHttpSites(ctx: ResolutionContext, file: string, content: string, sites: HttpSite[]): void {
+  const safe = stripCommentsForRegex(content, 'python');
+  const clients = pyClients(safe);
+  const lineOf = makeLineAt(safe, 1);
+  let nodes: Node[] | null = null;
+  const add = (index: number, open: number, verb: string, baseURL: string | null): void => {
+    const args = argumentsAt(safe, open);
+    if (!args || !args[0]) return;
+    let method: string | null = verb.toUpperCase();
+    let url = args[0];
+    if (verb === 'request' || verb === 'stream') {
+      method = pyStringAt(args[0])?.toUpperCase() ?? null;
+      if (!method || !HTTP_VERBS.has(method) || !args[1]) return;
+      url = args[1];
+    }
+    const literal = pyStringAt(url);
+    if (literal === null) return;
+    const path = clientPath(literal, baseURL);
+    if (!path) return;
+    const line = lineOf(index);
+    const fn = enclosingFn((nodes ??= ctx.getNodesInFile(file)), line);
+    if (!fn) return;
+    const callee = safe.slice(index, open).replace(/\s+/g, '');
+    sites.push({ fn, file, line, column: index - (safe.lastIndexOf('\n', index - 1) + 1), callee, method, browser: false, segs: path.segs, suffix: path.suffix, display: path.display });
+  };
+  PY_MODULE_CALL.lastIndex = 0;
+  let m: RegExpExecArray | null;
+  while ((m = PY_MODULE_CALL.exec(safe)) !== null) add(m.index, m.index + m[0].length - 1, m[2]!, null);
+  if (clients.size === 0) return;
+  PY_MEMBER_CALL.lastIndex = 0;
+  while ((m = PY_MEMBER_CALL.exec(safe)) !== null) {
+    const client = clients.get(m[1]!.replace(/^self\s*\.\s*/, ''));
+    if (client) add(m.index, m.index + m[0].length - 1, m[2]!, client.baseURL);
+  }
+}
+
+// -----------------------------------------------------------------------------
+// Gateway proxies
+// -----------------------------------------------------------------------------
+
+/** The request's own path, passed on: Starlette / FastAPI `request.url.path`, Flask `request.path`. */
+const INCOMING_PATH_GATE = /\.url\.path\b|\brequest\.(?:full_)?path\b/;
+const INCOMING_PATH = /^(?:[A-Za-z_]\w*\.url\.path|request\.(?:full_)?path)$/;
+const FORWARD_CALL = /(?<![\w.])((?:[A-Za-z_]\w*\s*\.\s*)*[A-Za-z_]\w*)\s*\.\s*([A-Za-z_]\w*)\s*\(/g;
+const FORWARD_METHODS = /^(?:request|send|stream|build_request|forward|proxy)$/;
+const HTTP_CLIENT_RECEIVER = /(?:client|http|session|upstream|backend|proxy)$/i;
+
+interface Proxy {
+  route: HttpRoute;
+  handler: Node;
+  line: number;
+  callee: string;
+}
+
+/**
+ * Python route handlers that forward the request they got: a call on an HTTP
+ * client (`crud_client.request(request.method, request.url.path, …)`) that
+ * passes the incoming path on. Nested functions count — a gateway often does
+ * the forwarding in a closure it runs off-thread.
+ */
+function gatewayProxies(ctx: ResolutionContext, routes: readonly HttpRoute[]): Proxy[] {
+  const byFile = new Map<string, HttpRoute[]>();
+  for (const r of routes) {
+    if (!r.node.filePath.endsWith('.py') || isTestPath(r.node.filePath)) continue;
+    const list = byFile.get(r.node.filePath) ?? [];
+    list.push(r);
+    byFile.set(r.node.filePath, list);
+  }
+  const out: Proxy[] = [];
+  for (const [file, list] of byFile) {
+    const content = ctx.readFile(file);
+    if (!content || !INCOMING_PATH_GATE.test(content)) continue;
+    const lines = stripCommentsForRegex(content, 'python').split('\n');
+    const fns = ctx.getNodesInFile(file).filter((n) => n.kind === 'function' || n.kind === 'method');
+    const forwards = new Map<string, { line: number; callee: string } | null>();
+    for (const route of list) {
+      // The handler is the def the route's decorators sit on.
+      let handler: Node | null = null;
+      for (const fn of fns) {
+        if (fn.startLine > route.node.startLine && fn.startLine - route.node.startLine <= 20 && (!handler || fn.startLine < handler.startLine)) handler = fn;
+      }
+      if (!handler) continue;
+      let forward = forwards.get(handler.id);
+      if (forward === undefined) {
+        forward = null;
+        const body = lines.slice(handler.startLine - 1, handler.endLine ?? handler.startLine).join('\n');
+        const lineOf = makeLineAt(body, handler.startLine);
+        FORWARD_CALL.lastIndex = 0;
+        let m: RegExpExecArray | null;
+        while (!forward && (m = FORWARD_CALL.exec(body)) !== null) {
+          const receiver = m[1]!.replace(/\s+/g, '');
+          if (!FORWARD_METHODS.test(m[2]!) && !(HTTP_CLIENT_RECEIVER.test(receiver) && HTTP_VERBS.has(m[2]!.toUpperCase()))) continue;
+          const args = argumentsAt(body, m.index + m[0].length - 1);
+          if (args?.some((a) => INCOMING_PATH.test(a))) forward = { line: lineOf(m.index), callee: `${receiver}.${m[2]}` };
+        }
+        forwards.set(handler.id, forward);
+      }
+      if (forward) out.push({ route, handler, ...forward });
+    }
+  }
+  return out;
+}
+
+const sameSegs = (a: readonly string[], b: readonly string[]): boolean =>
+  a.length === b.length && a.every((s, i) => (PARAM_SEG.test(s) && PARAM_SEG.test(b[i]!)) || s === b[i]);
+
+/** A proxy route's handler → the one route in another file with its method and exact path. */
+function proxyEdges(proxies: readonly Proxy[], routes: readonly HttpRoute[], edges: Edge[], seen: Set<string>): void {
+  for (const p of proxies) {
+    if (p.route.segs.some((s) => CATCH_ALL.test(s))) continue; // `{suffix:path}` forwards anything
+    const backends = routes.filter((r) =>
+      r.node.filePath !== p.route.node.filePath && r.method === p.route.method &&
+      !r.segs.some((s) => CATCH_ALL.test(s)) && sameSegs(r.segs, p.route.segs));
+    if (backends.length !== 1) continue;
+    const target = backends[0]!.node;
+    const key = `${p.handler.id}>${target.id}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    edges.push({
+      source: p.handler.id,
+      target: target.id,
+      kind: 'calls',
+      line: p.line,
+      column: 0,
+      provenance: 'heuristic',
+      metadata: {
+        synthesizedBy: 'http-proxy',
+        channel: 'http-proxy',
+        callee: p.callee,
+        tier: TIER_SERVER_TO_SERVER,
+        method: p.route.method,
+        href: '/' + p.route.segs.join('/'),
+        registeredAt: `${target.filePath}:${target.startLine}`,
+      },
+    });
   }
 }
 
@@ -1192,7 +1476,7 @@ export async function testRequestEdges(ctx: ResolutionContext, onYield: MaybeYie
   const seen = new Set<string>();
   for (const site of sites) {
     const route = matchHttp({ fn: site.from, file: site.from.filePath, line: site.line, column: site.column, callee: site.callee,
-      method: site.method, segs: site.segs, suffix: false, display: site.display }, routes);
+      method: site.method, browser: false, segs: site.segs, suffix: false, display: site.display }, routes, new Set())[0];
     if (!route) continue;
     const key = `${site.from.id}>${route.node.id}`;
     if (seen.has(key)) continue;
@@ -1222,7 +1506,7 @@ const QUEUE_GATE = /\.\s*add\s*\(|@Processor\s*\(|\bnew\s+Worker\s*[<(]|\.\s*pro
 const EVENT_GATE = /\.\s*(?:emit|emitAsync|on|once)\s*\(|@OnEvent\s*\(|@SubscribeMessage\s*\(/;
 
 export function hasCrossTierPattern(content: string): boolean {
-  return HTTP_GATE.test(content) || QUEUE_GATE.test(content) || EVENT_GATE.test(content);
+  return HTTP_GATE.test(content) || PY_HTTP_GATE.test(content) || INCOMING_PATH_GATE.test(content) || QUEUE_GATE.test(content) || EVENT_GATE.test(content);
 }
 
 export async function crossTierEdges(ctx: ResolutionContext, onYield: MaybeYield): Promise<Edge[]> {
@@ -1234,12 +1518,19 @@ export async function crossTierEdges(ctx: ResolutionContext, onYield: MaybeYield
   const handlers: Handler[] = [];
   const cache = new Map<string, FileFacts | null>();
 
+  const jsFiles: string[] = [];
   let scanned = 0;
   for (const file of ctx.getAllFiles()) {
-    if (!JS_FILE.test(file) || isTestPath(file) || isGeneratedFile(file)) continue;
+    const python = file.endsWith('.py');
+    if ((!JS_FILE.test(file) && !python) || isTestPath(file) || isGeneratedFile(file)) continue;
     if ((++scanned & 63) === 0) await onYield();
     const content = ctx.readFile(file);
     if (!content) continue;
+    if (python) {
+      if (routes.length > 0 && PY_HTTP_GATE.test(content)) collectPythonHttpSites(ctx, file, content, httpSites);
+      continue;
+    }
+    if (routes.length > 0) jsFiles.push(file);
     const wantsHttp = routes.length > 0 && HTTP_GATE.test(content);
     const wantsQueue = QUEUE_GATE.test(content);
     const wantsEvents = EVENT_GATE.test(content);
@@ -1255,10 +1546,33 @@ export async function crossTierEdges(ctx: ResolutionContext, onYield: MaybeYield
     if (wantsEvents) collectEvents(ctx, facts, dispatches, handlers, cache);
   }
 
+  // Calls of a fetch wrapper, once every file has said which functions are one.
+  const wrapperNames = new Set<string>();
+  for (const facts of cache.values()) for (const name of facts?.wrappers.keys() ?? []) wrapperNames.add(name);
+  if (wrapperNames.size > 0) {
+    const names = new RegExp(String.raw`(?<![\w$.])(${[...wrapperNames].map(escapeRe).join('|')})\s*\(`, 'g');
+    for (const file of jsFiles) {
+      const content = ctx.readFile(file);
+      names.lastIndex = 0;
+      if (!content || !names.test(content)) continue;
+      let facts = cache.get(file);
+      if (facts === undefined) {
+        facts = readFacts(ctx, file);
+        cache.set(file, facts);
+      }
+      if (facts) collectWrapperSites(ctx, facts, names, httpSites, cache);
+    }
+  }
+  const proxies = gatewayProxies(ctx, routes);
+  const proxyRouteIds = new Set(proxies.map((p) => p.route.node.id));
+
   const edges: Edge[] = [];
   const seen = new Set<string>();
   for (const site of httpSites) {
-    const route = matchHttp(site, routes);
+    // A method-less call onto a registration serving several methods is one
+    // hop to one handler: the first route stands for it, labelled with them all.
+    const matched = matchHttp(site, routes, proxyRouteIds);
+    const route = matched[0];
     if (!route || route.node.id === site.fn.id) continue;
     const key = `${site.fn.id}>${route.node.id}`;
     if (seen.has(key)) continue;
@@ -1274,13 +1588,15 @@ export async function crossTierEdges(ctx: ResolutionContext, onYield: MaybeYield
         synthesizedBy: 'http-client',
         channel: 'http',
         callee: site.callee,
-        tier: TIER_CLIENT_TO_SERVER,
-        method: site.method,
+        tier: site.file.endsWith('.py') ? TIER_SERVER_TO_SERVER : TIER_CLIENT_TO_SERVER,
+        method: site.method ?? matched.map((r) => r.method).join('|'),
         href: site.display,
         registeredAt: `${route.node.filePath}:${route.node.startLine}`,
+        ...(proxyRouteIds.has(route.node.id) ? { gateway: true } : {}),
       },
     });
   }
+  proxyEdges(proxies, routes, edges, seen);
   await onYield();
   pairQueue(producers, consumers, edges, seen);
   pairEvents(dispatches, handlers, edges, seen);

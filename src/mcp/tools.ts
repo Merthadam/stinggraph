@@ -3929,7 +3929,9 @@ export class ToolHandler {
           const step = best![i]!;
           if (step.edge) {
             const when = i > 0 ? this.whenLabel(cg, best![i - 1]!.node, step.edge) : '';
-            out.push(`   ↓ ${this.synthEdgeNote(step.edge) ?? step.edge.kind}${when ? ` (when ${when})` : ''}`);
+            // A route reaches the code that serves it through its handler link, not a call.
+            const kind = step.edge.kind === 'references' && best![i - 1]?.node.kind === 'route' ? 'handler' : step.edge.kind;
+            out.push(`   ↓ ${this.synthEdgeNote(step.edge) ?? kind}${when ? ` (when ${when})` : ''}`);
           }
           out.push(`${i + 1}. ${step.node.name} (${step.node.filePath}:${step.node.startLine})`);
         }
