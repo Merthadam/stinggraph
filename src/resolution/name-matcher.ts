@@ -546,6 +546,33 @@ function pythonLocalType(receiver: string, ref: UnresolvedRef, context: Resoluti
   return caller?.signature?.match(new RegExp(`\\b${receiver}\\s*:\\s*["']?([\\w.]+)`))?.[1] ?? null;
 }
 
+/**
+ * The class an `Annotated` annotation carries metadata on: FastAPI's
+ * dependency style, `repo: Annotated[PlanRepository, Depends(get_repo)]`, or
+ * through an alias, `Repo = Annotated[PlanRepository, Depends(...)]` then
+ * `repo: Repo`. The alias counts where Python looks it up from the call: an
+ * assignment at module level or in a def around the call; two of them in scope
+ * naming different classes say nothing. Any other type passes through as is.
+ */
+function pythonAnnotatedType(type: string | null, receiver: string, ref: UnresolvedRef, context: ResolutionContext): string | null {
+  if (!type || !/^\w+$/.test(type)) return type;
+  if (type === 'Annotated') {
+    const caller = context.getNodeById?.(ref.fromNodeId);
+    return caller?.signature?.match(new RegExp(`\\b${receiver}\\s*:\\s*(?:typing\\.)?Annotated\\s*\\[\\s*["']?([\\w.]+)`))?.[1] ?? null;
+  }
+  const lines = pythonMemberLines(ref.filePath, context);
+  const alias = new RegExp(`^\\s*(?:type\\s+)?${type}\\s*(?::\\s*(?:typing\\.)?TypeAlias\\s*)?=\\s*(?:typing\\.)?Annotated\\s*\\[\\s*["']?([\\w.]+)`);
+  const defs = pythonFileDefs(ref.filePath, context);
+  const targets = new Set<string>();
+  for (let i = 0; i < lines.length; i++) {
+    const target = lines[i]!.includes(type) ? lines[i]!.match(alias)?.[1] : undefined;
+    if (!target) continue;
+    const owner = defs.find((d) => d.startLine < i + 1 && d.endLine >= i + 1);
+    if (!owner || (owner.startLine <= ref.line && owner.endLine >= ref.line)) targets.add(target);
+  }
+  return targets.size === 1 ? [...targets][0]! : type;
+}
+
 /** A module-scope Python variable (not a class attribute or a function local). */
 function isPythonModuleGlobal(node: Node, context: ResolutionContext): boolean {
   return node.language === 'python' && (node.kind === 'variable' || node.kind === 'constant') &&
@@ -25247,6 +25274,8 @@ export function matchMethodCall(
     // A pytest test's parameter is what its fixture returns: flaskbb's
     // `cli_runner.invoke(…)` is click's `CliRunner`, not the project's one `invoke`.
     if (!inferredType && ref.language === 'python' && dotMatch) inferredType = pythonFixtureReturnType(objectOrClass!, ref, context);
+    // `repo: Repo` with `Repo = Annotated[PlanRepository, Depends(…)]`: the class the annotation carries.
+    if (inferredType && ref.language === 'python' && dotMatch) inferredType = pythonAnnotatedType(inferredType, objectOrClass!, ref, context);
     // A Kotlin local set from an unqualified call holds what that function
     // declares it returns: `val repo = repository()` (#2805), where the
     // receiver's name led to the interface `Repo`.

@@ -14,8 +14,9 @@
  *
  * - **`mode: 'named'`** is exactly what explore does. Every resolved symbol is
  *   both a possible start and a possible end, at most ONE unnamed symbol may
- *   bridge two named ones ({@link DEFAULT_MAX_BRIDGE}), and the LONGEST chain
- *   wins. The bridge cap is what stops the search wandering a god-function's
+ *   bridge two named ones ({@link DEFAULT_MAX_BRIDGE}) — two once the bridge
+ *   crosses a service boundary ({@link CROSS_TIER_EXTRA_BRIDGE}) — and the
+ *   LONGEST chain wins. The bridge cap is what stops the search wandering a god-function's
  *   fan-out: the agent's own naming is the evidence that a hop is on-topic.
  * - **`mode: 'directed'`** is "how does X reach Y", which the agent has no way
  *   to ask and the viewer's search box does. Both ends are pinned, so the
@@ -171,6 +172,17 @@ export const DIRECTED_MAX_HOPS = 12;
 
 /** At most one consecutive UNNAMED hop may bridge two named symbols. */
 export const DEFAULT_MAX_BRIDGE = 1;
+
+/**
+ * Extra unnamed hops a bridge may take once it has crossed a cross-tier edge
+ * (one carrying `metadata.tier`: a client's request onto a route, a gateway's
+ * proxy, an MCP tool call, a queue job). Across services the agent names the
+ * two ends it knows — the page's call, the repository method — and not the
+ * gateway handler and the backend handler in between, which it has no way to
+ * know. Crossing is the evidence that keeps this from wandering: a bridge that
+ * stays inside one service still gets {@link DEFAULT_MAX_BRIDGE} alone.
+ */
+export const CROSS_TIER_EXTRA_BRIDGE = 1;
 
 /** Seeds a `named` search starts from, and candidates an ambiguous token keeps. */
 const MAX_SEEDS = 8;
@@ -410,6 +422,8 @@ interface WalkStep {
   depth: number;
   /** Unnamed hops the route ends on, held against `maxBridge`. */
   streak: number;
+  /** Whether that unnamed run crossed a cross-tier edge, which allows {@link CROSS_TIER_EXTRA_BRIDGE} more. */
+  crossed: boolean;
   /** Named symbols on the route, the seed and this node included. */
   named: number;
 }
@@ -468,7 +482,8 @@ function walkCalls(
   const queue: string[] = [];
   /** Where each route waits in the queue. */
   const slot = new Map<string, number>();
-  const beats = (a: WalkStep, b: WalkStep) => a.depth <= b.depth && a.named >= b.named && a.streak <= b.streak;
+  const beats = (a: WalkStep, b: WalkStep) =>
+    a.depth <= b.depth && a.named >= b.named && a.streak <= b.streak && (a.crossed || !b.crossed);
   const keep = (step: WalkStep): void => {
     const kept = routes.get(step.node.id) ?? [];
     if (kept.some((other) => beats(parent.get(other)!, step))) return;
@@ -498,7 +513,7 @@ function walkCalls(
     }
     slot.set(key, place);
   };
-  keep({ prev: null, edge: null, node: seed, depth: 0, streak: 0, named: named.has(seed.id) ? 1 : 0 });
+  keep({ prev: null, edge: null, node: seed, depth: 0, streak: 0, crossed: false, named: named.has(seed.id) ? 1 : 0 });
   const reached: string[] = [];
   for (let head = 0; head < queue.length && routes.size < NAMED_VISIT_CAP; head++) {
     const key = queue[head]!;
@@ -516,11 +531,12 @@ function walkCalls(
       // are one symbol, and the const has already spent the budget.
       const free = c.node.kind === 'route' || (c.edge.metadata as { synthesizedBy?: unknown } | undefined)?.synthesizedBy === 'const-alias';
       const streak = isNamed ? 0 : free ? at.streak : at.streak + 1;
-      if (streak > maxBridge) continue;
+      const crossed = !isNamed && (at.crossed || (c.edge.metadata as { tier?: unknown } | undefined)?.tier !== undefined);
+      if (streak > maxBridge + (crossed ? CROSS_TIER_EXTRA_BRIDGE : 0)) continue;
       // A route never passes a node twice: going round a cycle counts its named
       // symbols again and would out-rank the flow it repeats.
       if (onRoute(parent, key, c.node.id)) continue;
-      keep({ prev: key, edge: c.edge, node: c.node, depth: at.depth + 1, streak, named: at.named + (isNamed ? 1 : 0) });
+      keep({ prev: key, edge: c.edge, node: c.node, depth: at.depth + 1, streak, crossed, named: at.named + (isNamed ? 1 : 0) });
     }
   }
   return { parent, reached };

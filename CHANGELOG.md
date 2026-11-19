@@ -66,6 +66,7 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - A request between your services now connects: a page's call through its own fetch wrapper, a Python `httpx`, `requests` or `aiohttp` call to another service, and a gateway route that forwards requests on to the backend route it serves all link to the route they reach.
 - Python MCP clients now link to the server tools they call: a literal tool name passed to `call_tool`, or to your own wrapper around it, reaches the `@mcp.tool()` function registered under that name.
 - `codegraph_explore`'s Flow now continues from a route into the function that handles it, so a flow from a client call reaches the server code it runs.
+- `codegraph_explore`'s Flow now follows a request across services when your query names only its two ends, through the gateway and backend handlers in between, and it reaches a call made through a JavaScript parameter's default (`{ api = plansApi }`) or a FastAPI `Annotated[…, Depends(…)]` parameter.
 
 ### Fixes
 
