@@ -22,6 +22,7 @@
  *   codegraph implementations <symbol>  List the types that implement or extend a trait, interface or class
  *   codegraph affected [files]   Find test files affected by changes
  *   codegraph cycles [path]      List circular imports between files
+ *   codegraph layers [path]      List services/modules and the edges between them
  *   codegraph ui [path]          Open the browser viewer (alias: web; not released yet — needs CODEGRAPH_UI=1)
  *   codegraph upgrade [version]  Update CodeGraph to the latest release
  */
@@ -3086,6 +3087,81 @@ program
       }
     } catch (err) {
       error(`cycles failed: ${err instanceof Error ? err.message : String(err)}`);
+      process.exit(1);
+    }
+  });
+
+/** Roll-up rows `codegraph layers` prints; `--json` lists them all. */
+const CLI_LAYER_EDGES_SHOWN = 30;
+
+/**
+ * codegraph layers [path]
+ *
+ * Services and modules (inferred, refined by `.stinggraph/layers.yaml`), their
+ * file counts and entry points, config errors, and the edges between them.
+ */
+program
+  .command('layers [path]')
+  .description('List services/modules (from .stinggraph/layers.yaml or inferred) and the edges between them')
+  .option('-l, --level <level>', 'Roll-up level: service or module', 'service')
+  .option('--exclude-tests', 'Leave edges from or to test files out of the roll-up')
+  .option('-j, --json', 'Output as JSON')
+  .action(async (pathArg: string | undefined, options: { level: string; excludeTests?: boolean; json?: boolean }) => {
+    const projectPath = resolveProjectPath(pathArg);
+    if (options.level !== 'service' && options.level !== 'module') {
+      error(`--level must be "service" or "module", got "${options.level}"`);
+      process.exit(1);
+    }
+    const level = options.level;
+
+    try {
+      if (!isInitialized(projectPath)) {
+        error(`CodeGraph not initialized in ${projectPath}`);
+        process.exit(1);
+      }
+
+      const cg = await openIndexToRead(projectPath);
+      try {
+        const layers = cg.getLayers();
+        const rollup = cg.getLayerRollup({ level, excludeTests: options.excludeTests, layers });
+        if (options.json) {
+          const { assignments: _assignments, ...rest } = layers;
+          console.log(JSON.stringify({ ...rest, rollup }, null, 2));
+          return;
+        }
+        const total = layers.services.reduce((n, s) => n + s.files, 0);
+        console.log(chalk.bold(`\nLayers: ${layers.services.filter((s) => s.origin !== 'unassigned').length} services, ${total} files`)
+          + chalk.dim(layers.config ? ` (${layers.config} over inference)` : ' (inferred; no .stinggraph/layers.yaml)'));
+        for (const s of layers.services) {
+          const name = s.label === s.id ? s.id : `${s.id} "${s.label}"`;
+          console.log(`\n${chalk.cyan(name)}  ${s.files} files  ${chalk.dim([s.origin, ...s.roots, ...s.evidence].join(' · '))}`);
+          if (s.aliases.length) console.log(chalk.dim(`   aliases: ${s.aliases.join(', ')}`));
+          if (s.modules.length) console.log(`   modules: ${s.modules.map((m) => `${m.id} ${m.files}`).join(', ')}`);
+          const routes = s.entryPoints.filter((e) => e.kind === 'route');
+          const runs = s.entryPoints.filter((e) => e.kind === 'compose');
+          const handlers = s.entryPoints.filter((e) => e.kind === 'handler');
+          if (runs.length) console.log(`   compose: ${runs.map((e) => `${e.name} → ${e.file}`).join(', ')}`);
+          if (routes.length) console.log(`   routes (${routes.length}): ${routes.slice(0, 8).map((e) => e.name).join(', ')}${routes.length > 8 ? ', …' : ''}`);
+          if (handlers.length) console.log(`   handlers (${handlers.length}): ${handlers.slice(0, 8).map((e) => e.name).join(', ')}${handlers.length > 8 ? ', …' : ''}`);
+        }
+        if (layers.errors.length) {
+          console.log(chalk.yellow(`\nConfig errors (${layers.errors.length})`));
+          for (const e of layers.errors) console.log(`   ${e.source}: ${e.message}${e.candidates ? ` [${e.candidates.join(', ')}]` : ''}`);
+        }
+        console.log(chalk.bold(`\nRoll-up by ${level}${rollup.excludeTests ? ', tests excluded' : ''}: ${rollup.edges.length} pairs`));
+        for (const e of rollup.edges.slice(0, CLI_LAYER_EDGES_SHOWN)) {
+          const kinds = Object.entries(e.byKind).sort((a, b) => b[1] - a[1]).map(([k, n]) => `${k} ${n}`).join(', ');
+          console.log(`   ${e.from} → ${e.to}  ${e.total}  ${chalk.dim(kinds + (e.synthesized ? `; synthesized ${e.synthesized}` : ''))}`);
+        }
+        if (rollup.edges.length > CLI_LAYER_EDGES_SHOWN) {
+          console.log(chalk.dim(`   ... and ${rollup.edges.length - CLI_LAYER_EDGES_SHOWN} more (--json lists them all)`));
+        }
+        console.log();
+      } finally {
+        cg.destroy();
+      }
+    } catch (err) {
+      error(`layers failed: ${err instanceof Error ? err.message : String(err)}`);
       process.exit(1);
     }
   });

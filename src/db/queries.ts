@@ -3522,6 +3522,26 @@ export class QueryBuilder {
   }
 
   /**
+   * Edges between two files, counted per file pair and kind: `kinds`, plus any
+   * synthesized edge whatever its kind. What the service-layer roll-up groups.
+   */
+  getFileEdgeCounts(kinds: readonly EdgeKind[]): Array<{ source: string; target: string; kind: EdgeKind; count: number; synthesized: number }> {
+    const synthesized = "(e.metadata IS NOT NULL AND json_valid(e.metadata) AND json_extract(e.metadata, '$.synthesizedBy') IS NOT NULL)";
+    return this.db
+      .prepare(
+        `SELECT sn.file_path AS source, tn.file_path AS target, e.kind AS kind,
+                COUNT(*) AS count, SUM(CASE WHEN ${synthesized} THEN 1 ELSE 0 END) AS synthesized
+           FROM edges e
+           JOIN nodes sn ON sn.id = e.source
+           JOIN nodes tn ON tn.id = e.target
+          WHERE sn.file_path <> tn.file_path
+            AND (e.kind IN (${kinds.map(() => '?').join(',')}) OR ${synthesized})
+          GROUP BY sn.file_path, tn.file_path, e.kind`
+      )
+      .all(...kinds) as Array<{ source: string; target: string; kind: EdgeKind; count: number; synthesized: number }>;
+  }
+
+  /**
    * Every unresolved reference recorded in one FILE, ordered by line.
    *
    * The per-symbol form above answers "what does this body reach that the
