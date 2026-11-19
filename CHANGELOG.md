@@ -297,6 +297,7 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 #### Python
 
+- In a Python monorepo, a method call on a value whose type CodeGraph can't tell, like `self.session.get(…)`, no longer links to a same-named method in another service that nothing in the caller's package imports.
 - In Python, `import a.b as X` written inside a function now links its calls like `X.f()`, as the same import at module level already did. Thanks @Egrn. (#2600)
 - In Python, `other.update(…)` after `from pkg import other` no longer links into the module when a parameter, local or loop variable named `other` gives it another value. Thanks @BGamboa13. (#2632)
 - In Python, `from app import email` no longer links the importing file to a project variable named `app`, such as a FastAPI or Flask `app = FastAPI()`. (#2584)

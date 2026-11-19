@@ -1228,6 +1228,57 @@ function pythonImportedFiles(m: ImportMapping, filePath: string, context: Resolu
   return files;
 }
 
+/**
+ * Whether a Python method guessed by its name alone (a receiver nothing typed)
+ * is in a module the calling package can never load: none of the modules in
+ * the caller's directory reaches it through its imports, at any depth. A value
+ * of a class comes from code its holder's package imports, or is handed over
+ * by a package module that wires it (auth's `self.store.update` holds the
+ * `SessionStore` its sibling `api.py` constructs). In a monorepo every
+ * service's `get` / `execute` / `delete` shares one name pool, and crud's
+ * `self.session.get` on a SQLAlchemy session went to auth's
+ * `SessionStore.get`, which nothing crud imports leads to. A bare `self` /
+ * `cls` receiver is the enclosing class's, and one spelling the owner class
+ * (`gateway.GatewayConfig`, a module loaded by path) names it.
+ */
+export function isPythonGuessOutOfReach(target: Node, ref: UnresolvedRef, context: ResolutionContext): boolean {
+  if (ref.language !== 'python' || target.language !== 'python' || target.filePath === ref.filePath) return false;
+  const dot = ref.referenceName.lastIndexOf('.');
+  const receiver = ref.referenceName.slice(0, dot);
+  const cut = target.qualifiedName.lastIndexOf('::');
+  if (dot < 0 || /^(?:self|cls|super\(\))$/.test(receiver) ||
+      (cut > 0 && receiver.slice(receiver.lastIndexOf('.') + 1) === target.qualifiedName.slice(0, cut).split('::').pop())) return false;
+  const dir = ref.filePath.slice(0, ref.filePath.lastIndexOf('/') + 1);
+  return !pythonNameScan(context, `package-reach\0${dir}`, () => {
+    const reached = new Set<string>();
+    const queue = context.getAllFiles().filter((f) => f.startsWith(dir) && !f.includes('/', dir.length) && /\.pyi?$/.test(f));
+    for (const f of queue) reached.add(f);
+    for (let i = 0; i < queue.length; i++) {
+      for (const f of pythonDirectImports(queue[i]!, context)) {
+        if (!reached.has(f)) { reached.add(f); queue.push(f); }
+      }
+    }
+    return reached;
+  }).has(target.filePath);
+}
+
+/** The project modules `filePath`'s imports name: the module itself, a `from pkg import mod` submodule, a star import's module. */
+function pythonDirectImports(filePath: string, context: ResolutionContext): string[] {
+  return pythonNameScan(context, `direct-imports\0${filePath}`, () => {
+    const files = new Set<string>();
+    for (const m of context.getImportMappings(filePath, 'python')) {
+      const moduleFile = context.resolveModuleFile?.(m.source, filePath, 'python');
+      if (moduleFile) files.add(moduleFile);
+      for (const f of pythonImportedFiles(m, filePath, context)) files.add(f);
+    }
+    for (const r of context.getReExports?.(filePath, 'python') ?? []) {
+      const moduleFile = r.kind === 'wildcard' ? context.resolveModuleFile?.(r.source, filePath, 'python') : null;
+      if (moduleFile) files.add(moduleFile);
+    }
+    return [...files];
+  });
+}
+
 const PYTHON_MAIN_GUARD = /^if\s+(?:__name__\s*==\s*(['"])__main__\1|(['"])__main__\2\s*==\s*__name__)\s*:/;
 /** Line indexes inside a top-level `if __name__ == "__main__":` block — script code, not module state. */
 function pythonMainBlockLines(filePath: string, context: ResolutionContext): Set<number> {
