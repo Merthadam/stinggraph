@@ -471,6 +471,35 @@ Each of these cost real debugging time; they are not hypothetical.
    in an indexed repository could hang the index. Checked against path-to-regexp
    on the 344 entries of 157 real proxies: 339 read, all agreeing on 27
    addresses, and 5 left unread, which link nothing.
+23. **A request between services crosses a route, a gateway and a handler.**
+   (API frameworks; FastAPI first, verified 2026-11 on travella.) Four facts
+   had to hold before a page's `request('/v1/plans')` reached the backend's
+   `create` in explore's Flow:
+   - **A router is declared per factory.** `def create_router(): router =
+     APIRouter(prefix="/v1/plans")` twice in one file under the same name; the
+     FastAPI prefix pass takes the declaration whose function encloses the
+     decorator, or every route in the file gets the last prefix.
+   - **`@app.api_route(path, methods=[…])` is one route per method** (GET when
+     `methods=` is absent), all bound to the one handler.
+   - **A gateway serves the backend's paths too.** A handler that passes the
+     incoming path on (`request.url.path` into a client call) is a proxy:
+     `http-proxy` links it to the one route in another file with its method
+     and exact path (a `{x:path}` catch-all links nothing). A page's
+     same-origin call that both serve goes to the proxy; a service's call
+     through a configured base URL that both serve links nothing, since only
+     deployment config says which one it reaches.
+   - **A route links its handler with `references`.** Flow rides that one
+     `references` edge (route → function/method) and prints it as `handler`;
+     without it every client → route flow ended at the route.
+   The client side: a project's own fetch wrapper (`function request(path)
+   { fetch(path, …) }`) is followed one level from its literal call sites;
+   Python `httpx` / `requests` / `aiohttp` calls on a bound client are read
+   like `fetch`. An MCP client's literal `call_tool("x")`, directly or through
+   a wrapper whose first parameter reaches it, links to the one
+   `@server.tool()` function named `x` (`mcp-tool`). Still open: a client
+   handed in untyped (`self.client.call`) resolves to whichever `call` the
+   name matcher picks, and a proxy that forwards a catch-all has no static
+   target.
 
 ---
 

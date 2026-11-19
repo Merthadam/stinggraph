@@ -135,6 +135,17 @@ export const FLOW_CALLABLE_KINDS: ReadonlySet<string> = new Set([
 export const FLOW_EDGE_KINDS: ReadonlySet<string> = new Set(['calls', 'navigates']);
 
 /**
+ * Whether a flow may ride `edge` from `from` to `to`: a call or navigation, or
+ * a route's link to its handler. Frameworks record that link as `references`
+ * (`GET /users` → `listUsers`), so without it a client's request onto a route
+ * ended the flow at the route instead of in the code that serves it.
+ */
+export function ridesFlow(edge: Edge, from: Node, to: Node): boolean {
+  if (FLOW_EDGE_KINDS.has(edge.kind)) return true;
+  return edge.kind === 'references' && from.kind === 'route' && (to.kind === 'function' || to.kind === 'method');
+}
+
+/**
  * Node kinds that can be an endpoint of a SYNTHESIZED edge without being
  * callable. An RTK thunk is `const X = createAsyncThunk(...)`, so a thunk →
  * thunk hop is constant → constant and the callable-only set cannot hold it.
@@ -497,7 +508,7 @@ function walkCalls(
     if (id !== seed.id && named.has(id)) reached.push(key);
     if (at.depth >= maxHops - 1) continue;
     for (const c of calleesOf(id)) {
-      if (!FLOW_EDGE_KINDS.has(c.edge.kind)) continue;
+      if (!ridesFlow(c.edge, at.node, c.node)) continue;
       const isNamed = named.has(c.node.id);
       // A route node is a connector, not a symbol the reader would have named:
       // crossing one costs no bridge budget. Nor does the hop from a const to the
@@ -577,7 +588,7 @@ function walkBidirectional(
       const next: Node[] = [];
       for (const node of frontF) {
         for (const c of cg.getCallees(node.id)) {
-          if (!FLOW_EDGE_KINDS.has(c.edge.kind) || forward.has(c.node.id)) continue;
+          if (!ridesFlow(c.edge, node, c.node) || forward.has(c.node.id)) continue;
           forward.set(c.node.id, { prev: node.id, edge: c.edge, node: c.node });
           next.push(c.node);
         }
@@ -589,7 +600,7 @@ function walkBidirectional(
       const next: Node[] = [];
       for (const node of frontB) {
         for (const c of cg.getCallers(node.id)) {
-          if (!FLOW_EDGE_KINDS.has(c.edge.kind) || backward.has(c.node.id)) continue;
+          if (!ridesFlow(c.edge, c.node, node) || backward.has(c.node.id)) continue;
           backward.set(c.node.id, { next: node.id, edge: c.edge });
           backNodes.set(c.node.id, c.node);
           next.push(c.node);

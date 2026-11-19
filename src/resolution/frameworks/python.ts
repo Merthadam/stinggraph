@@ -278,7 +278,8 @@ export const fastapiResolver: FrameworkResolver = {
 
   extract(filePath, content) {
     if (!filePath.endsWith('.py')) return { nodes: [], references: [] };
-    return extractDecoratorRoutes(filePath, stripCommentsForRegex(content, 'python'), {
+    const safe = stripCommentsForRegex(content, 'python');
+    const verbs = extractDecoratorRoutes(filePath, safe, {
       // FastAPI: @x.METHOD('/path') -> handler on the next def line. Path may be
       // empty ("") for routes mounted at the router/prefix root.
       decoratorRegex: /@(\w+)\.(get|post|put|patch|delete|options|head)\s*\(\s*['"]([^'"]*)['"]/g,
@@ -288,6 +289,19 @@ export const fastapiResolver: FrameworkResolver = {
       findHandler: true,
       language: 'python',
     });
+    // `@x.api_route('/path', methods=['GET', 'POST'])`: one route per method,
+    // GET when `methods=` is absent, as FastAPI defaults it.
+    const apiRoutes = extractDecoratorRoutes(filePath, safe, {
+      decoratorRegex: /@(\w+)\.api_route\s*\(\s*['"]([^'"]*)['"]([^)]*)\)/g,
+      defaultMethod: 'GET',
+      pathGroup: 2,
+      eachMethodFromGroup: 3,
+      findHandler: true,
+      language: 'python',
+    });
+    const nodes = [...verbs.nodes, ...apiRoutes.nodes];
+    const references = [...verbs.references, ...apiRoutes.references];
+    return { nodes, references };
   },
 
   /**
@@ -313,8 +327,9 @@ export const fastapiResolver: FrameworkResolver = {
       fromVar: string;
       prefix: string;
       target: { file: string; variable: string };
+      line: number;
     }
-    const own = new Map<string, Map<string, string>>(); // file → router variable → APIRouter(prefix=)
+    const own = new Map<string, RouterDecl[]>(); // file → its APIRouter(prefix=) declarations
     const mounts = new Map<string, Mount[]>(); // mounting file → mounts
     const receivers = new Map<string, Map<number, string>>(); // file → decorator line → router variable
     for (const file of context.getAllFiles()) {
@@ -322,16 +337,17 @@ export const fastapiResolver: FrameworkResolver = {
       const content = context.readFile(file);
       if (!content || (!content.includes('APIRouter') && !content.includes('include_router'))) continue;
       const safe = stripCommentsForRegex(content, 'python');
-      const vars = new Map<string, string>();
+      const decls: RouterDecl[] = [];
       const decl = /\b([A-Za-z_]\w*)\s*=\s*APIRouter\s*\(([^)]*)\)/g;
       let m: RegExpExecArray | null;
       while ((m = decl.exec(safe)) !== null) {
         const p = /\bprefix\s*=\s*['"]([^'"]*)['"]/.exec(m[2]!);
-        vars.set(m[1]!, p ? p[1]! : '');
+        decls.push({ variable: m[1]!, prefix: p ? p[1]! : '', line: safe.slice(0, m.index).split('\n').length });
       }
-      own.set(file, vars);
+      own.set(file, decls);
+      const vars = new Set(decls.map((d) => d.variable));
       const byLine = new Map<number, string>();
-      const deco = /@([A-Za-z_]\w*)\.(?:get|post|put|patch|delete|options|head)\s*\(/g;
+      const deco = /@([A-Za-z_]\w*)\.(?:get|post|put|patch|delete|options|head|api_route)\s*\(/g;
       while ((m = deco.exec(safe)) !== null) byLine.set(safe.slice(0, m.index).split('\n').length, m[1]!);
       receivers.set(file, byLine);
       const inc = /\b([A-Za-z_]\w*)\.include_router\s*\(\s*([A-Za-z_][\w.]*)\s*((?:,[^)]*)?)\)/g;
@@ -342,11 +358,41 @@ export const fastapiResolver: FrameworkResolver = {
         const target = includedRouter(m[2]!, file, vars, context);
         if (!target) continue;
         const list = mounts.get(file) ?? [];
-        list.push({ fromVar: m[1]!, prefix: literal ? literal[1]! : '', target });
+        list.push({ fromVar: m[1]!, prefix: literal ? literal[1]! : '', target, line: safe.slice(0, m.index).split('\n').length });
         mounts.set(file, list);
       }
     }
-    if (mounts.size === 0 && ![...own.values()].some((vars) => [...vars.values()].some((p) => p !== ''))) return [];
+    if (mounts.size === 0 && ![...own.values()].some((decls) => decls.some((d) => d.prefix !== ''))) return [];
+
+    // A router variable is often declared once per factory function
+    // (`def create_router(): router = APIRouter(prefix=…)`), so one file can
+    // hold several `router`s: a use takes the declaration whose function
+    // encloses it, the innermost first.
+    const scopes = new Map<string, Node[]>();
+    const ownPrefix = (file: string, variable: string, line: number): string => {
+      const decls = (own.get(file) ?? []).filter((d) => d.variable === variable);
+      if (decls.length <= 1) return decls[0]?.prefix ?? '';
+      let fns = scopes.get(file);
+      if (!fns) {
+        fns = context.getNodesInFile(file).filter((n) => n.kind === 'function' || n.kind === 'method');
+        scopes.set(file, fns);
+      }
+      const scopeOf = (l: number): Node | null => {
+        let best: Node | null = null;
+        for (const fn of fns!) {
+          if (fn.startLine < l && l <= fn.endLine && (!best || fn.endLine - fn.startLine < best.endLine - best.startLine)) best = fn;
+        }
+        return best;
+      };
+      let pick: { decl: RouterDecl; size: number } | null = null;
+      for (const d of decls) {
+        const scope = scopeOf(d.line);
+        if (scope && !(scope.startLine <= line && line <= scope.endLine)) continue;
+        const size = scope ? scope.endLine - scope.startLine : Infinity;
+        if (!pick || size < pick.size || (size === pick.size && d.line <= line)) pick = { decl: d, size };
+      }
+      return pick?.decl.prefix ?? '';
+    };
 
     // The include-derived base of each (file, variable): the mounting router's
     // base, plus its own prefix, plus the mount's — to a fixed point.
@@ -357,7 +403,7 @@ export const fastapiResolver: FrameworkResolver = {
       for (const [file, list] of mounts) {
         for (const mount of list) {
           const fromBase = base.get(key(file, mount.fromVar)) ?? '';
-          const fromOwn = own.get(file)?.get(mount.fromVar) ?? '';
+          const fromOwn = ownPrefix(file, mount.fromVar, mount.line);
           const full = joinPyPaths(joinPyPaths(fromBase, fromOwn), mount.prefix);
           const k = key(mount.target.file, mount.target.variable);
           const seen = next.get(k);
@@ -374,12 +420,11 @@ export const fastapiResolver: FrameworkResolver = {
 
     const updates: Node[] = [];
     for (const [file, byLine] of receivers) {
-      const vars = own.get(file) ?? new Map<string, string>();
       for (const route of context.getNodesInFile(file)) {
         if (route.kind !== 'route') continue;
         const variable = byLine.get(route.startLine);
         if (!variable) continue;
-        const prefix = joinPyPaths(base.get(key(file, variable)) ?? '', vars.get(variable) ?? '');
+        const prefix = joinPyPaths(base.get(key(file, variable)) ?? '', ownPrefix(file, variable, route.startLine));
         if (prefix === '' || prefix === '/') continue;
         const sep = route.qualifiedName.indexOf('::');
         const colon = sep < 0 ? -1 : route.qualifiedName.indexOf(':', sep + 2);
@@ -393,6 +438,12 @@ export const fastapiResolver: FrameworkResolver = {
     return updates;
   },
 };
+
+interface RouterDecl {
+  variable: string;
+  prefix: string;
+  line: number;
+}
 
 /** `/api/v1` + `/items` → `/api/v1/items`; `/items` + `` → `/items`; `` + `` → ``. */
 function joinPyPaths(prefix: string, path: string): string {
@@ -410,7 +461,7 @@ function joinPyPaths(prefix: string, path: string): string {
 function includedRouter(
   expr: string,
   file: string,
-  local: Map<string, string>,
+  local: ReadonlySet<string>,
   context: ResolutionContext
 ): { file: string; variable: string } | null {
   const segs = expr.split('.');
@@ -433,6 +484,8 @@ interface DecoratorRouteOpts {
   defaultMethod: string;
   methodGroup?: number;
   methodFromGroup?: number; // methods=[...] list
+  /** A group holding `methods=[...]`: one route per method listed (else `defaultMethod`). */
+  eachMethodFromGroup?: number;
   pathGroup: number;
   handlerGroup?: number;
   findHandler?: boolean;
@@ -453,22 +506,13 @@ function extractDecoratorRoutes(filePath: string, content: string, opts: Decorat
       const m = match[opts.methodFromGroup]!.match(/['"]([A-Z]+)['"]/i);
       if (m) method = m[1]!.toUpperCase();
     }
+    let methods = [method];
+    if (opts.eachMethodFromGroup) {
+      const list = /\bmethods\s*=\s*[[({]([^\])}]*)[\])}]/.exec(match[opts.eachMethodFromGroup] ?? '');
+      const listed = list ? [...list[1]!.matchAll(/['"]([A-Za-z]+)['"]/g)].map((x) => x[1]!.toUpperCase()) : [];
+      if (listed.length > 0) methods = [...new Set(listed)];
+    }
     const line = content.slice(0, match.index).split('\n').length;
-    const name = method ? `${method} ${routePath || '/'}` : (routePath || '/');
-    const routeNode: Node = {
-      id: `route:${filePath}:${line}:${method}:${routePath}`,
-      kind: 'route',
-      name,
-      qualifiedName: `${filePath}::${method}:${routePath}`,
-      filePath,
-      startLine: line,
-      endLine: line,
-      startColumn: 0,
-      endColumn: match[0].length,
-      language: opts.language,
-      updatedAt: now,
-    };
-    nodes.push(routeNode);
 
     let handlerName: string | undefined;
     if (opts.handlerGroup && match[opts.handlerGroup]) {
@@ -478,16 +522,32 @@ function extractDecoratorRoutes(filePath: string, content: string, opts: Decorat
       const defMatch = tail.match(/\n\s*(?:async\s+)?def\s+(\w+)/);
       if (defMatch) handlerName = defMatch[1];
     }
-    if (handlerName) {
-      references.push({
-        fromNodeId: routeNode.id,
-        referenceName: handlerName,
-        referenceKind: 'references',
-        line,
-        column: 0,
+    for (const method of methods) {
+      const routeNode: Node = {
+        id: `route:${filePath}:${line}:${method}:${routePath}`,
+        kind: 'route',
+        name: method ? `${method} ${routePath || '/'}` : (routePath || '/'),
+        qualifiedName: `${filePath}::${method}:${routePath}`,
         filePath,
-        language: 'python',
-      });
+        startLine: line,
+        endLine: line,
+        startColumn: 0,
+        endColumn: match[0].length,
+        language: opts.language,
+        updatedAt: now,
+      };
+      nodes.push(routeNode);
+      if (handlerName) {
+        references.push({
+          fromNodeId: routeNode.id,
+          referenceName: handlerName,
+          referenceKind: 'references',
+          line,
+          column: 0,
+          filePath,
+          language: 'python',
+        });
+      }
     }
   }
   return { nodes, references };

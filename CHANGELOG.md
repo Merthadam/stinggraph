@@ -63,6 +63,9 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - CodeIgniter 3 projects are now understood: controller methods and `routes.php` entries become routes, HMVC modules included, and calls through what `$this->load` loads link to the method they reach. Thanks @darkspock.
 - In Drupal, services from `*.services.yml`, plugin definitions and `#[Hook]` methods are now in the graph, and a call through `\Drupal::service('x')` reaches the method on that service's class. Thanks @mikedamoiseau and @marcelovani.
 - In Next.js, a route now links to the `proxy.ts` or `middleware.ts` that runs before it, following `config.matcher`, so impact, callers and `codegraph_explore` show which routes a change to it reaches. Thanks @RIGOandre.
+- A request between your services now connects: a page's call through its own fetch wrapper, a Python `httpx`, `requests` or `aiohttp` call to another service, and a gateway route that forwards requests on to the backend route it serves all link to the route they reach.
+- Python MCP clients now link to the server tools they call: a literal tool name passed to `call_tool`, or to your own wrapper around it, reaches the `@mcp.tool()` function registered under that name.
+- `codegraph_explore`'s Flow now continues from a route into the function that handles it, so a flow from a client call reaches the server code it runs.
 
 ### Fixes
 
@@ -299,6 +302,7 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 #### Python
 
 - In a Python monorepo, a method call on a value whose type CodeGraph can't tell, like `self.session.get(…)`, no longer links to a same-named method in another service that nothing in the caller's package imports.
+- In FastAPI, routes now take the prefix of the `APIRouter` created in their own function, so two router factories in one file no longer give every route the last one's prefix, and `@app.api_route(…)` routes are now found, one per listed method.
 - In Python, `import a.b as X` written inside a function now links its calls like `X.f()`, as the same import at module level already did. Thanks @Egrn. (#2600)
 - In Python, `other.update(…)` after `from pkg import other` no longer links into the module when a parameter, local or loop variable named `other` gives it another value. Thanks @BGamboa13. (#2632)
 - In Python, `from app import email` no longer links the importing file to a project variable named `app`, such as a FastAPI or Flask `app = FastAPI()`. (#2584)
