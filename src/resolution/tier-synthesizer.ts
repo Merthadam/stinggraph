@@ -51,6 +51,7 @@ import { isGeneratedFile } from '../extraction/generated-detection';
 import { isTestPath } from '../search/query-utils';
 import { HOLE, readStringAt } from './frameworks/expo-router';
 import { enclosingFn, enclosingValue, makeLineAt } from './synth-utils';
+import { readComposeTopology, type ComposeTopology } from './compose-topology';
 
 const JS_FILE = /\.(?:[cm]?[jt]sx?)$/;
 
@@ -465,6 +466,10 @@ interface HttpSite {
   /** The path began with a hole — a base URL — and matches a route by its tail. */
   suffix: boolean;
   display: string;
+  /** A Python call's base URL as written (`self.base_url`, `os.environ["X"]`, an absolute literal), with the line it is read at. */
+  base?: { expr: string; line: number };
+  /** The one compose service's directory the base URL points at: the call reaches routes there only. */
+  scope?: TopologyBinding;
 }
 
 function httpRoutes(ctx: ResolutionContext): HttpRoute[] {
@@ -516,6 +521,7 @@ function matchHttp(site: HttpSite, routes: readonly HttpRoute[], proxies: Readon
   let best: HttpRoute[] = [];
   let bestScore = -1;
   for (const r of routes) {
+    if (site.scope && !r.node.filePath.startsWith(site.scope.dir + '/')) continue;
     if (site.method !== null && r.method !== 'ALL' && r.method !== 'ANY' && r.method !== site.method) continue;
     let score: number | null;
     if (site.suffix) {
@@ -760,9 +766,15 @@ const PY_MODULE_CALL = /(?<![\w.])(httpx|requests)\s*\.\s*(get|post|put|patch|de
 const PY_MEMBER_CALL = /(?<![\w.])((?:self\s*\.\s*)?[A-Za-z_]\w*)\s*\.\s*(get|post|put|patch|delete|head|options|request|stream)\s*\(/g;
 const PY_HTTP_GATE = /\b(?:httpx|requests|aiohttp)\b/;
 
+interface PyClient {
+  baseURL: string | null;
+  /** The `base_url=` argument as written, and the index it is written at. */
+  base: { expr: string; index: number } | null;
+}
+
 /** Names a Python file binds to an HTTP client (`with httpx.AsyncClient(…) as client`, `self.http = requests.Session()`), with the base URL. */
-function pyClients(safe: string): Map<string, { baseURL: string | null }> {
-  const out = new Map<string, { baseURL: string | null }>();
+function pyClients(safe: string): Map<string, PyClient> {
+  const out = new Map<string, PyClient>();
   PY_CLIENT_CTOR.lastIndex = 0;
   let m: RegExpExecArray | null;
   while ((m = PY_CLIENT_CTOR.exec(safe)) !== null) {
@@ -776,7 +788,8 @@ function pyClients(safe: string): Map<string, { baseURL: string | null }> {
     const assigned = /(?:^|[^\w.])(?:self\s*\.\s*)?([A-Za-z_]\w*)\s*=\s*(?:await\s+)?$/.exec(safe.slice(Math.max(0, m.index - 80), m.index));
     const as = /^\s*as\s+([A-Za-z_]\w*)/.exec(safe.slice(close + 1, close + 80));
     const name = as?.[1] ?? assigned?.[1];
-    if (name) out.set(name, { baseURL });
+    const baseArg = base ? argumentsAt(safe, open)?.find((a) => /^base_url\s*=/.test(a)) : undefined;
+    if (name) out.set(name, { baseURL, base: baseArg ? { expr: baseArg.replace(/^base_url\s*=\s*/, ''), index: m.index } : null });
   }
   return out;
 }
@@ -786,7 +799,8 @@ function collectPythonHttpSites(ctx: ResolutionContext, file: string, content: s
   const clients = pyClients(safe);
   const lineOf = makeLineAt(safe, 1);
   let nodes: Node[] | null = null;
-  const add = (index: number, open: number, verb: string, baseURL: string | null): void => {
+  const add = (index: number, open: number, verb: string, client: PyClient | null): void => {
+    const baseURL = client?.baseURL ?? null;
     const args = argumentsAt(safe, open);
     if (!args || !args[0]) return;
     let method: string | null = verb.toUpperCase();
@@ -804,7 +818,12 @@ function collectPythonHttpSites(ctx: ResolutionContext, file: string, content: s
     const fn = enclosingFn((nodes ??= ctx.getNodesInFile(file)), line);
     if (!fn) return;
     const callee = safe.slice(index, open).replace(/\s+/g, '');
-    sites.push({ fn, file, line, column: index - (safe.lastIndexOf('\n', index - 1) + 1), callee, method, browser: false, segs: path.segs, suffix: path.suffix, display: path.display });
+    // What the host comes from: the f-string's leading field, an absolute literal, or the client's `base_url=`.
+    const field = literal.startsWith(HOLE) ? pyLeadingField(url) : null;
+    const base = field !== null ? { expr: field, line }
+      : ABSOLUTE_URL.test(literal) ? { expr: url, line }
+      : client?.base ? { expr: client.base.expr, line: lineOf(client.base.index) } : undefined;
+    sites.push({ fn, file, line, column: index - (safe.lastIndexOf('\n', index - 1) + 1), callee, method, browser: false, segs: path.segs, suffix: path.suffix, display: path.display, base });
   };
   PY_MODULE_CALL.lastIndex = 0;
   let m: RegExpExecArray | null;
@@ -813,7 +832,275 @@ function collectPythonHttpSites(ctx: ResolutionContext, file: string, content: s
   PY_MEMBER_CALL.lastIndex = 0;
   while ((m = PY_MEMBER_CALL.exec(safe)) !== null) {
     const client = clients.get(m[1]!.replace(/^self\s*\.\s*/, ''));
-    if (client) add(m.index, m.index + m[0].length - 1, m[2]!, client.baseURL);
+    if (client) add(m.index, m.index + m[0].length - 1, m[2]!, client);
+  }
+}
+
+/** The expression of an f-string's leading `{…}` field (`f"{self.base_url}/v1"` → `self.base_url`); null otherwise. */
+function pyLeadingField(text: string): string | null {
+  const m = /^\s*[rRbBuU]?[fF][rRbBuU]?(?:'''|"""|'|")\{(?!\{)/.exec(text);
+  if (!m) return null;
+  let depth = 0;
+  for (let i = m[0].length; i < text.length; i++) {
+    const c = text[i];
+    if (c === '(' || c === '[' || c === '{') depth++;
+    else if (c === ')' || c === ']') depth--;
+    else if (c === '}') {
+      if (depth === 0) return text.slice(m[0].length, i).replace(/![rsa]$/, '').trim();
+      depth--;
+    }
+  }
+  return null;
+}
+
+// -----------------------------------------------------------------------------
+// Topology binding: a Python base URL read from config, onto one compose service
+// -----------------------------------------------------------------------------
+
+export interface TopologyBinding {
+  /** The target compose service's source directory. */
+  dir: string;
+  /** What named it: the environment variable, or the URL host. */
+  via: string;
+}
+
+interface TopologyScan {
+  ctx: ResolutionContext;
+  topo: ComposeTopology;
+  pyFiles: string[] | null;
+  lines: Map<string, string[]>;
+  memo: Map<string, TopologyBinding | null>;
+}
+
+const PY_ENV_READ = /(?<![\w.])(?:os\s*\.\s*)?(?:environ\s*\[\s*(['"])([\w.-]+)\1\s*\]|environ\s*\.\s*get\s*\(\s*(['"])([\w.-]+)\3|getenv\s*\(\s*(['"])([\w.-]+)\5)/;
+const URL_HOST = /^[a-z][a-z0-9+.-]*:\/\/(?:[^/@]*@)?([A-Za-z0-9_.-]+)/i;
+const MAX_TRACE_DEPTH = 6;
+
+function pyLines(t: TopologyScan, file: string): string[] {
+  let lines = t.lines.get(file);
+  if (!lines) {
+    lines = stripCommentsForRegex(t.ctx.readFile(file) ?? '', 'python').split(/\r?\n/);
+    t.lines.set(file, lines);
+  }
+  return lines;
+}
+
+/** One binding when every reading agrees on the directory; null when any is unknown or two disagree. */
+function agreed(bindings: ReadonlyArray<TopologyBinding | null>): TopologyBinding | null {
+  if (bindings.length === 0 || bindings.some((b) => b === null)) return null;
+  const all = bindings as TopologyBinding[];
+  if (all.some((b) => b.dir !== all[0]!.dir)) return null;
+  return { dir: all[0]!.dir, via: [...new Set(all.map((b) => b.via))].join('|') };
+}
+
+/** `base_url.rstrip("/")`, `(x)`, `str(x)`, `x or "…"`, `x if … else …` → `x`. */
+function pyCore(expr: string): string {
+  let e = expr.trim();
+  for (;;) {
+    const before = e;
+    e = e
+      .replace(/\s*\.\s*(?:r?strip|removesuffix)\s*\([^()]*\)\s*$/, '')
+      .replace(/^str\s*\(\s*([^()]*)\s*\)$/, '$1')
+      .replace(/^\(\s*([^()]*)\s*\)$/, '$1')
+      .replace(/^(.+?)\s+(?:or|if)\s[\s\S]*$/, '$1')
+      .trim();
+    if (e === before) return e;
+  }
+}
+
+/** A def's parameters (`self` / `cls` dropped), each with its positional index, -1 once keyword-only. */
+function pyParams(t: TopologyScan, file: string, fn: Node): Map<string, number> | null {
+  const lines = pyLines(t, file);
+  const text = lines.slice(fn.startLine - 1, fn.startLine + 15).join('\n');
+  const def = new RegExp(String.raw`\bdef\s+${escapeRe(fn.name)}\s*\(`).exec(text);
+  if (!def) return null;
+  const args = argumentsAt(text, def.index + def[0].length - 1);
+  if (!args) return null;
+  const out = new Map<string, number>();
+  let pos = 0;
+  for (const [i, a] of args.entries()) {
+    if (a.startsWith('*')) {
+      pos = -1;
+      continue;
+    }
+    const name = /^[A-Za-z_]\w*/.exec(a)?.[0];
+    if (!name || (i === 0 && (name === 'self' || name === 'cls'))) continue;
+    out.set(name, pos);
+    if (pos >= 0) pos++;
+  }
+  return out;
+}
+
+function classAt(nodes: readonly Node[], line: number): Node | null {
+  let best: Node | null = null;
+  for (const n of nodes) {
+    if (n.kind === 'class' && n.startLine <= line && (n.endLine ?? n.startLine) >= line && (!best || n.startLine >= best.startLine)) best = n;
+  }
+  return best;
+}
+
+/** Every right-hand side assigned to `target` in lines [from, to) — `target = x`, `target: T = x`. */
+function assignments(lines: readonly string[], from: number, to: number, target: string, indent?: number): Array<{ rhs: string; line: number }> {
+  const re = new RegExp(String.raw`^(\s*)${target}\s*(?::[^=]+)?=(?!=)\s*(.+)$`);
+  const out: Array<{ rhs: string; line: number }> = [];
+  for (let i = Math.max(0, from); i < Math.min(lines.length, to); i++) {
+    const m = re.exec(lines[i]!);
+    if (m && (indent === undefined || m[1]!.length === indent)) out.push({ rhs: m[2]!, line: i + 1 });
+  }
+  return out;
+}
+
+/**
+ * The compose service a Python base-URL expression points at, read at `line`
+ * of `file`: an environment read (`os.environ["X"]`, `os.getenv("X")`), a
+ * literal URL whose host is a compose service, a local or module variable
+ * assigned one, `self.attr` assigned one in its class (a constructor parameter
+ * followed to every construction of the class), or a settings field (a
+ * pydantic `BaseSettings` field's environment name, else its default). Null
+ * as soon as anything is unknown or two readings disagree.
+ */
+function pyBaseBinding(t: TopologyScan, file: string, line: number, expr: string, depth = 0): TopologyBinding | null {
+  if (depth > MAX_TRACE_DEPTH) return null;
+  const e = pyCore(expr);
+  const literal = pyStringAt(e);
+  if (literal !== null) {
+    const host = URL_HOST.exec(literal)?.[1];
+    const dir = host ? t.topo.hostDirs.get(host) : undefined;
+    return host && dir ? { dir, via: host } : null;
+  }
+  const env = PY_ENV_READ.exec(e);
+  if (env && env.index === 0) {
+    const name = env[2] ?? env[4] ?? env[6]!;
+    const dir = t.topo.envDirs.get(name);
+    return dir ? { dir, via: name } : null;
+  }
+  const nodes = t.ctx.getNodesInFile(file);
+  const lines = pyLines(t, file);
+  const self = /^self\s*\.\s*([A-Za-z_]\w*)$/.exec(e);
+  if (self) {
+    const cls = classAt(nodes, line);
+    if (!cls) return null;
+    const found = assignments(lines, cls.startLine - 1, cls.endLine ?? cls.startLine, String.raw`self\s*\.\s*${self[1]}`);
+    return agreed(found.map((a) => pyBaseBinding(t, file, a.line, a.rhs, depth + 1)));
+  }
+  if (/^[A-Za-z_]\w*$/.test(e)) {
+    const fn = enclosingFn(nodes, line);
+    if (fn) {
+      const params = pyParams(t, file, fn);
+      if (params?.has(e)) {
+        const cls = fn.name === '__init__' ? classAt(nodes, line) : null;
+        return cls ? constructionBinding(t, cls, e, params.get(e)!, depth) : null;
+      }
+      const local = assignments(lines, fn.startLine, fn.endLine ?? fn.startLine, e);
+      if (local.length > 0) return agreed(local.map((a) => pyBaseBinding(t, file, a.line, a.rhs, depth + 1)));
+    }
+    const top = assignments(lines, 0, lines.length, e, 0);
+    return agreed(top.map((a) => pyBaseBinding(t, file, a.line, a.rhs, depth + 1)));
+  }
+  const field = /^(?:[A-Za-z_]\w*(?:\(\))?\s*\.\s*)+([A-Za-z_]\w*)$/.exec(e);
+  return field ? settingsBinding(t, field[1]!, depth) : null;
+}
+
+function projectPyFiles(t: TopologyScan): string[] {
+  return (t.pyFiles ??= t.ctx.getAllFiles().filter((f) => f.endsWith('.py') && !isTestPath(f) && !isGeneratedFile(f)));
+}
+
+/** A constructor parameter's value at every construction of its class outside tests — all must agree. */
+function constructionBinding(t: TopologyScan, cls: Node, param: string, position: number, depth: number): TopologyBinding | null {
+  const key = `new:${cls.id}:${param}`;
+  if (t.memo.has(key)) return t.memo.get(key)!;
+  t.memo.set(key, null); // a construction that reaches back here is unknown
+  const classes = t.ctx.getNodesByName(cls.name).filter((n) => n.kind === 'class' && n.language === 'python');
+  let result: TopologyBinding | null = null;
+  if (classes.length === 1) {
+    const readings: Array<TopologyBinding | null> = [];
+    const call = new RegExp(String.raw`(?<![\w])${escapeRe(cls.name)}\s*\(`, 'g');
+    const keyword = new RegExp(String.raw`^${param}\s*=(?!=)\s*`);
+    for (const file of projectPyFiles(t)) {
+      const content = t.ctx.readFile(file);
+      if (!content || !content.includes(cls.name)) continue;
+      const safe = pyLines(t, file).join('\n');
+      const lineOf = makeLineAt(safe, 1);
+      call.lastIndex = 0;
+      let m: RegExpExecArray | null;
+      while ((m = call.exec(safe)) !== null) {
+        if (/\bclass\s+$/.test(safe.slice(Math.max(0, m.index - 12), m.index))) continue;
+        const args = argumentsAt(safe, m.index + m[0].length - 1) ?? [];
+        const firstNamed = args.findIndex((a) => /^\*|^[A-Za-z_]\w*\s*=(?!=)/.test(a));
+        const byPosition = firstNamed < 0 ? args : args.slice(0, firstNamed);
+        const named = args.find((a) => keyword.test(a));
+        const arg = named !== undefined ? named.replace(keyword, '') : position >= 0 ? byPosition[position] : undefined;
+        readings.push(arg === undefined ? null : pyBaseBinding(t, file, lineOf(m.index), arg, depth + 1));
+      }
+    }
+    result = agreed(readings);
+  }
+  t.memo.set(key, result);
+  return result;
+}
+
+/**
+ * A settings field read off an object (`settings.crud_base_url`): the one
+ * class in the project that declares it. A pydantic `BaseSettings` field reads
+ * its environment name (`alias=` / `validation_alias=`, else `env_prefix` +
+ * the field, upper-cased), any field its default.
+ */
+function settingsBinding(t: TopologyScan, field: string, depth: number): TopologyBinding | null {
+  const key = `field:${field}`;
+  if (t.memo.has(key)) return t.memo.get(key)!;
+  t.memo.set(key, null);
+  const defs: Array<{ file: string; line: number; settings: boolean; body: string; value: string | null }> = [];
+  const decl = new RegExp(String.raw`^(\s+)${field}\s*(?::\s*[^=]+?)?\s*(?:=(?!=)\s*(.+))?$`);
+  for (const file of projectPyFiles(t)) {
+    if (!t.ctx.readFile(file)?.includes(field)) continue;
+    const lines = pyLines(t, file);
+    for (let i = 0; i < lines.length; i++) {
+      const head = /^(\s*)class\s+\w+\s*(?:\(([^)]*)\))?\s*:/.exec(lines[i]!);
+      if (!head) continue;
+      const indent = head[1]!.length;
+      let end = i + 1;
+      while (end < lines.length && (!lines[end]!.trim() || lines[end]!.length - lines[end]!.trimStart().length > indent)) end++;
+      const bodyIndent = lines.slice(i + 1, end).find((l) => l.trim())?.search(/\S/) ?? -1;
+      for (let j = i + 1; j < end; j++) {
+        const m = decl.exec(lines[j]!);
+        if (!m || m[1]!.length !== bodyIndent || (!m[2] && !lines[j]!.includes(':'))) continue;
+        defs.push({ file, line: j + 1, settings: /BaseSettings/.test(head[2] ?? ''), body: lines.slice(i, end).join('\n'), value: m[2] ?? null });
+      }
+    }
+  }
+  let result: TopologyBinding | null = null;
+  if (defs.length === 1) {
+    const def = defs[0]!;
+    if (def.settings) {
+      const alias = /\b(?:validation_alias|alias|env)\s*=\s*['"]([\w.-]+)['"]/.exec(def.value ?? '')?.[1];
+      const prefix = /\benv_prefix\s*=\s*['"]([^'"]*)['"]/.exec(def.body)?.[1] ?? '';
+      const name = alias ?? (prefix + field).toUpperCase();
+      const dir = t.topo.envDirs.get(name);
+      if (dir) result = { dir, via: name };
+    }
+    if (!result && def.value) {
+      // `Field("http://crud:8001", …)` / `Field(default=…)` / `field(default_factory=lambda: os.getenv("X"))`.
+      const env = PY_ENV_READ.exec(def.value);
+      const fieldCall = /^Field\s*\(|^field\s*\(/.exec(def.value);
+      const args = fieldCall ? argumentsAt(def.value, fieldCall[0].length - 1) ?? [] : null;
+      const value = env ? env[0] : args ? (args.find((a) => /^default\s*=/.test(a))?.replace(/^default\s*=\s*/, '') ?? (args[0] && !/^\w+\s*=/.test(args[0]) ? args[0] : null)) : def.value;
+      if (value) result = pyBaseBinding(t, def.file, def.line, value, depth + 1);
+    }
+  }
+  t.memo.set(key, result);
+  return result;
+}
+
+/** Narrow each Python call whose base URL traces to one compose service onto that service's routes. */
+function bindTopology(ctx: ResolutionContext, sites: readonly HttpSite[]): void {
+  const traced = sites.filter((s) => s.base !== undefined);
+  if (traced.length === 0) return;
+  const topo = readComposeTopology(ctx.getProjectRoot());
+  if (!topo) return;
+  const t: TopologyScan = { ctx, topo, pyFiles: null, lines: new Map(), memo: new Map() };
+  for (const site of traced) {
+    const scope = pyBaseBinding(t, site.file, site.base!.line, site.base!.expr);
+    if (scope) site.scope = scope;
   }
 }
 
@@ -1625,6 +1912,7 @@ export async function crossTierEdges(ctx: ResolutionContext, onYield: MaybeYield
       if (facts) collectWrapperSites(ctx, facts, names, httpSites, cache);
     }
   }
+  bindTopology(ctx, httpSites);
   const proxies = gatewayProxies(ctx, routes);
   const proxyRouteIds = new Set(proxies.map((p) => p.route.node.id));
 
@@ -1655,6 +1943,7 @@ export async function crossTierEdges(ctx: ResolutionContext, onYield: MaybeYield
         href: site.display,
         registeredAt: `${route.node.filePath}:${route.node.startLine}`,
         ...(proxyRouteIds.has(route.node.id) ? { gateway: true } : {}),
+        ...(site.scope ? { topology: `${site.scope.via} → ${site.scope.dir}` } : {}),
       },
     });
   }

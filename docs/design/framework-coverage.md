@@ -485,9 +485,19 @@ Each of these cost real debugging time; they are not hypothetical.
      incoming path on (`request.url.path` into a client call) is a proxy:
      `http-proxy` links it to the one route in another file with its method
      and exact path (a `{x:path}` catch-all links nothing). A page's
-     same-origin call that both serve goes to the proxy; a service's call
-     through a configured base URL that both serve links nothing, since only
-     deployment config says which one it reaches.
+     same-origin call that both serve goes to the proxy. A service's call
+     through a configured base URL that both serve is bound by compose
+     topology (2026-11): root `compose*.yaml` / `docker-compose*.yml` maps an
+     `environment:` variable to the service its URL's host names, and that
+     service to the directory its `command` (or Dockerfile `CMD`) enters, else
+     its build context; a Python base URL traced to that variable
+     (`os.environ` / `os.getenv`, a local, `self.attr` through every
+     construction of the class, a pydantic `BaseSettings` field or its default)
+     or to a literal URL with that host reaches routes in that directory only,
+     edge metadata `topology: "VAR → dir"`. Anything ambiguous (two services
+     for one variable, a constructor built with two, a root or unknown
+     directory, a host outside compose) still links nothing. Still open: JS
+     clients (`process.env.X` base URLs) and compose files below the root.
    - **A route links its handler with `references`.** Flow rides that one
      `references` edge (route → function/method) and prints it as `handler`;
      without it every client → route flow ended at the route.
