@@ -94,4 +94,66 @@ describe('a Python guess by method name out of the calling package\'s reach', ()
     }, 'load');
     expect(out).toEqual(['method:SessionStore::get']);
   });
+
+  const PLANS = 'def as_utc(value):\n    return value\n\n\nclass PlanRepository:\n    def fetch(self, plan_id):\n        return plan_id\n\n\ndef make_repo():\n    return PlanRepository()\n';
+
+  it('does not link a service whose module the package reaches only for a helper beside the class', async () => {
+    const out = await calls({
+      ...BASE,
+      'services/auth/plans.py': PLANS,
+      'services/crud/canvas.py': 'from services.auth.plans import as_utc\n\n\ndef run(plan):\n    as_utc(plan)\n    return plan.fetch("revision")\n',
+    }, 'run');
+    expect(out).toEqual(['function:as_utc']);
+  });
+
+  it('keeps the guess when a helper imported from the module hands out the class', async () => {
+    const out = await calls({
+      ...BASE,
+      'services/auth/plans.py': PLANS,
+      'services/crud/canvas.py': 'from services.auth.plans import make_repo\n\n\ndef run(plan, key):\n    return plan.fetch(key)\n',
+    }, 'run');
+    expect(out).toEqual(['method:PlanRepository::fetch']);
+  });
+});
+
+describe('a Python guess by method name on a local that is evidently a builtin value', () => {
+  const STORE_PKG = {
+    'pyproject.toml': '[project]\nname = "mono"\n',
+    'app/__init__.py': '',
+    'app/plans.py': 'class PlanRepository:\n    def get(self, plan_id):\n        return plan_id\n\n    def items(self):\n        return []\n',
+    // A class `Plan` is what lets `plan.get` past the builtin-method filter.
+    'app/models.py': 'class Plan:\n    pass\n',
+  };
+  const caller = (body: string, sig = 'subject') =>
+    `from app.plans import PlanRepository\n\n\ndef read(${sig}) -> dict[str, int]:\n    return {}\n\n\ndef handle(${sig}):\n${body}`;
+
+  it.each([
+    ['a dict literal', '    plan = {"revision": 1}\n    return plan.get("revision")\n'],
+    ['a multi-line dict literal', '    plan = {\n        "revision": 1,\n    }\n    return plan.get("revision")\n'],
+    ['dict(...)', '    plan = dict(revision=1)\n    return plan.get("revision")\n'],
+    ['model_dump()', '    plan = subject.model_dump(mode="json")\n    return plan.get("revision")\n'],
+    ['json()', '    plan = subject.json()\n    return plan.get("revision")\n'],
+    ['json.loads()', '    plan = json.loads(subject)\n    return plan.get("revision")\n'],
+    ['a dict annotation', '    plan: dict[str, int] = load(subject)\n    return plan.get("revision")\n'],
+    ['a same-file function annotated -> dict', '    plan = read(subject)\n    return plan.get("revision")\n'],
+  ])('does not link a local bound to %s', async (_label, body) => {
+    const out = await calls({ ...STORE_PKG, 'app/service.py': caller(body) }, 'handle');
+    expect(out.filter((c) => c.startsWith('method:'))).toEqual([]);
+  });
+
+  it('does not link a parameter annotated as a Mapping', async () => {
+    const out = await calls({
+      ...STORE_PKG,
+      'app/service.py': caller('    return plan.get("revision")\n', 'plan: Mapping[str, int], subject'),
+    }, 'handle');
+    expect(out).toEqual([]);
+  });
+
+  it('keeps the guess on a local the project constructs', async () => {
+    const out = await calls({
+      ...STORE_PKG,
+      'app/service.py': caller('    plan = make_repo(subject)\n    return plan.get("revision")\n'),
+    }, 'handle');
+    expect(out).toEqual(['method:PlanRepository::get']);
+  });
 });

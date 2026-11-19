@@ -1239,7 +1239,8 @@ function pythonImportedFiles(m: ImportMapping, filePath: string, context: Resolu
  * `self.session.get` on a SQLAlchemy session went to auth's
  * `SessionStore.get`, which nothing crud imports leads to. A bare `self` /
  * `cls` receiver is the enclosing class's, and one spelling the owner class
- * (`gateway.GatewayConfig`, a module loaded by path) names it.
+ * (`gateway.GatewayConfig`, a module loaded by path) names it. A module
+ * reached for something else does not put its class in hand either.
  */
 export function isPythonGuessOutOfReach(target: Node, ref: UnresolvedRef, context: ResolutionContext): boolean {
   if (ref.language !== 'python' || target.language !== 'python' || target.filePath === ref.filePath) return false;
@@ -1249,7 +1250,7 @@ export function isPythonGuessOutOfReach(target: Node, ref: UnresolvedRef, contex
   if (dot < 0 || /^(?:self|cls|super\(\))$/.test(receiver) ||
       (cut > 0 && receiver.slice(receiver.lastIndexOf('.') + 1) === target.qualifiedName.slice(0, cut).split('::').pop())) return false;
   const dir = ref.filePath.slice(0, ref.filePath.lastIndexOf('/') + 1);
-  return !pythonNameScan(context, `package-reach\0${dir}`, () => {
+  const reached = pythonNameScan(context, `package-reach\0${dir}`, () => {
     const reached = new Set<string>();
     const queue = context.getAllFiles().filter((f) => f.startsWith(dir) && !f.includes('/', dir.length) && /\.pyi?$/.test(f));
     for (const f of queue) reached.add(f);
@@ -1259,7 +1260,74 @@ export function isPythonGuessOutOfReach(target: Node, ref: UnresolvedRef, contex
       }
     }
     return reached;
-  }).has(target.filePath);
+  });
+  if (!reached.has(target.filePath)) return true;
+  // The module is reached, but maybe only for a helper beside the class:
+  // agent's `from services.crud.repository import as_utc` hands it no
+  // `PlanRepository`, so its dict `plan.get(…)` is no `PlanRepository.get`.
+  if (cut <= 0 || target.filePath.startsWith(dir) && !target.filePath.includes('/', dir.length)) return false;
+  const owner = target.qualifiedName.slice(0, cut).split('::').pop()!;
+  return !pythonNameScan(context, `class-in-hand\0${dir}\0${target.filePath}\0${owner}`, () =>
+    [...reached].some((f) => f !== target.filePath && pythonFileHandsClass(f, owner, target.filePath, context)));
+}
+
+/**
+ * Whether `filePath` can hand over a value of class `owner` (declared in
+ * `ownerFile`): it names the class (an import, a construction, a subclass's
+ * base), imports `ownerFile` whole, or imports from it a definition whose own
+ * text names the class (a factory).
+ */
+function pythonFileHandsClass(filePath: string, owner: string, ownerFile: string, context: ResolutionContext): boolean {
+  const word = new RegExp(`\\b${owner}\\b`);
+  if ((context.fileContains?.(filePath, owner) ?? true) && word.test(context.readFile(filePath) ?? '')) return true;
+  for (const m of context.getImportMappings(filePath, 'python')) {
+    if (pythonImportedFiles(m, filePath, context).includes(ownerFile)) return true;
+    if (context.resolveModuleFile?.(m.source, filePath, 'python') !== ownerFile) continue;
+    if (m.isNamespace || m.exportedName === '*') return true;
+    const lines = context.getFileLines?.(ownerFile) ?? context.readFile(ownerFile)?.split(/\r?\n/) ?? [];
+    if ((context.getNodesInFileNamed?.(ownerFile, m.exportedName) ?? context.getNodesInFile(ownerFile).filter((n) => n.name === m.exportedName))
+      .some((n) => word.test(lines.slice(n.startLine - 1, n.endLine).join('\n')))) return true;
+  }
+  return (context.getReExports?.(filePath, 'python') ?? []).some((r) =>
+    r.kind === 'wildcard' && context.resolveModuleFile?.(r.source, filePath, 'python') === ownerFile);
+}
+
+/**
+ * Whether a Python local whose method was guessed by name is evidently a
+ * builtin value — a dict, list, str — whose methods are the runtime's: its
+ * nearest binding in the calling function is a literal, `dict(…)`,
+ * `x.model_dump()` / `x.dict()` / `x.json()`, `json.loads(…)`, a call to a
+ * same-file function annotated `-> dict[…]`, or an annotation such as
+ * `dict[str, Any]` / `Mapping`, on the local or on the parameter it is.
+ * agent's `plan = await self._read_plan(…)` then `plan.get("revision")` is
+ * no `PlanRepository.get`.
+ */
+export function isPythonBuiltinValueReceiver(ref: UnresolvedRef, context: ResolutionContext): boolean {
+  if (ref.language !== 'python') return false;
+  const receiver = ref.referenceName.slice(0, Math.max(0, ref.referenceName.lastIndexOf('.')));
+  if (!/^[A-Za-z_]\w*$/.test(receiver) || /^(?:self|cls)$/.test(receiver)) return false;
+  const caller = context.getNodeById?.(ref.fromNodeId);
+  if (!caller || (caller.kind !== 'function' && caller.kind !== 'method')) return false;
+  const lines = pythonMemberLines(ref.filePath, context);
+  const binding = new RegExp(`^\\s*${receiver}\\s*(?::\\s*([^=]+?))?\\s*(?:=(?!=)\\s*(.+))?$`);
+  for (let i = ref.line - 2; i >= caller.startLine; i--) {
+    const m = binding.exec(lines[i] ?? '');
+    if (!m || (m[1] === undefined && m[2] === undefined)) continue;
+    if (m[1] !== undefined) return pythonAnnotationEvidence(m[1].replace(/,$/, '')) === 'runtime';
+    const value = m[2]!.trim().replace(/^await\s+/, '');
+    // A literal opening a multi-line value has no shape yet.
+    if (/^(?:[{[]|dict\()/.test(value) || pythonValueEvidence(value, null) === 'runtime') return true;
+    const shape = pythonExprShape(value);
+    if (shape === null) return false;
+    if (/\.(?:model_dump|dict|json)\(\)$|^json\.loads?\(\)$/.test(shape)) return true;
+    const callee = /^(?:(?:self|cls)\.)?([A-Za-z_]\w*)\(\)$/.exec(shape)?.[1];
+    const returns = callee && context.getNodesInFile(ref.filePath)
+      .filter((n) => n.name === callee && (n.kind === 'function' || n.kind === 'method'))
+      .map((n) => /->\s*(.+)$/.exec(n.signature ?? '')?.[1]);
+    return !!returns && returns.length > 0 && returns.every((r) => r !== undefined && pythonAnnotationEvidence(r) === 'runtime');
+  }
+  const param = new RegExp(`[(,]\\s*${receiver}\\s*:\\s*([^,)=]+)`).exec(caller.signature ?? '');
+  return !!param && pythonAnnotationEvidence(param[1]!) === 'runtime';
 }
 
 /** The project modules `filePath`'s imports name: the module itself, a `from pkg import mod` submodule, a star import's module. */

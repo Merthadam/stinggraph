@@ -303,6 +303,7 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 #### Python
 
 - In a Python monorepo, a method call on a value whose type CodeGraph can't tell, like `self.session.get(…)`, no longer links to a same-named method in another service that nothing in the caller's package imports.
+- A Python call like `plan.get(…)` on a dict (a literal, `dict(…)`, `.model_dump()`, `json.loads(…)`, or a `dict` / `Mapping` annotation) no longer links to a project class's method of that name, nor to a class in another service whose module the caller imports only for a helper.
 - In FastAPI, routes now take the prefix of the `APIRouter` created in their own function, so two router factories in one file no longer give every route the last one's prefix, and `@app.api_route(…)` routes are now found, one per listed method.
 - In Python, `import a.b as X` written inside a function now links its calls like `X.f()`, as the same import at module level already did. Thanks @Egrn. (#2600)
 - In Python, `other.update(…)` after `from pkg import other` no longer links into the module when a parameter, local or loop variable named `other` gives it another value. Thanks @BGamboa13. (#2632)
