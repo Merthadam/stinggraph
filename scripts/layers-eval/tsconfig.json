@@ -1,0 +1,5 @@
+{
+  "//": "Same as scripts/overlay-eval: these scripts load dist/ and need the real web-tree-sitter package, not the root tsconfig's .d.ts mapping.",
+  "compilerOptions": { "target": "ES2022", "module": "commonjs", "esModuleInterop": true, "strict": true, "skipLibCheck": true, "noEmit": true },
+  "include": ["*.ts"]
+}

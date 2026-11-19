@@ -1,0 +1,175 @@
+version: 1
+name: Stinggraph DB map
+description: >-
+  One base index per repo (origin/main, codegraph.db); each Stingray worktree has an overlay.db with the same graph
+  tables plus the overlay-only ones, and ATTACHes the base read-only. Dashed edges cross databases and are checked in
+  code. The solid FK edges hold in the base; overlay edges have none, since either end may be a base node.
+kind: tables
+scope:
+  include:
+    - src/db/schema.sql
+    - src/db/index.ts
+    - src/overlay/database.ts
+    - src/overlay/merged-resolver.ts
+use: [sql]
+# Keep the map to the tables that explain how CodeGraph works; these three are plumbing.
+exclude:
+  - schema_versions
+  - name_segment_vocab
+  - synthesis_inputs
+rules:
+  # --- Groups: who uses which tables -------------------------------------------------------------
+  - id: group-git
+    language: typescript
+    files: ["src/db/index.ts"]
+    query: |
+      (lexical_declaration (variable_declarator name: (identifier) @n (#eq? @n "DATABASE_FILENAME")))
+    emit:
+      group: { id: git, label: "Git (repo and worktrees)" }
+
+  # --- Repo / worktree side ----------------------------------------------------------------------
+  - id: repo-main
+    language: typescript
+    files: ["src/db/index.ts"]
+    query: |
+      (lexical_declaration (variable_declarator name: (identifier) @n (#eq? @n "DATABASE_FILENAME")))
+    emit:
+      node:
+        id: repo-main
+        label: "Repo @ origin/main"
+        kind: repo
+        group: git
+        subtitle: "base index: <repo>/.codegraph/codegraph.db"
+        detail: "One full index of the latest fetched origin/main. Only the base indexer writes it; base_commit, base_ref and layer_kind='base' live in project_metadata, files.git_blob_id stamps each file's blob."
+  - id: repo-main-fields
+    language: typescript
+    files: ["src/db/index.ts"]
+    query: |
+      (lexical_declaration (variable_declarator name: (identifier) @n (#eq? @n "DATABASE_FILENAME")))
+    emit:
+      field: { node: repo-main, id: db, label: ".codegraph/codegraph.db", type: "base DB", badges: [read-only for worktrees] }
+  - id: worktree
+    language: typescript
+    files: ["src/overlay/database.ts"]
+    query: |
+      (function_declaration name: (identifier) @n (#eq? @n "createOverlay"))
+    emit:
+      node:
+        id: worktree
+        label: "Stingray worktree (one per branch)"
+        kind: worktree
+        group: git
+        subtitle: "overlay: <worktree>/.codegraph/overlay.db"
+        detail: "Holds only the files the branch changed since its merge-base with origin/main, rebuilt from git on each commit (git diff --name-status, git show). Merged view = overlay rows + base rows of files the overlay does not own."
+  - id: worktree-fields
+    language: typescript
+    files: ["src/overlay/database.ts"]
+    query: |
+      (function_declaration name: (identifier) @n (#eq? @n "createOverlay"))
+    emit:
+      field: { node: worktree, id: db, label: ".codegraph/overlay.db", type: "overlay DB", badges: [writable] }
+  - id: worktree-attaches-base
+    language: typescript
+    files: ["src/overlay/database.ts"]
+    query: |
+      (function_declaration name: (identifier) @n (#eq? @n "attachReadOnly"))
+    emit:
+      edge: { from: worktree, to: repo-main, label: "ATTACH base ?mode=ro", style: dashed }
+  - id: repo-writes-meta
+    language: typescript
+    files: ["src/db/index.ts"]
+    query: |
+      (lexical_declaration (variable_declarator name: (identifier) @n (#eq? @n "DATABASE_FILENAME")))
+    emit:
+      edge: { from: repo-main, to: "sql:src/db/schema.sql#project_metadata", label: "base_commit, base_ref, layer_kind" }
+  - id: worktree-owns-files
+    language: typescript
+    files: ["src/overlay/database.ts"]
+    query: |
+      (function_declaration name: (identifier) @n (#eq? @n "createOverlay"))
+    emit:
+      edge: { from: worktree, to: "sql:src/overlay/database.ts#overlay_files", label: "changed files (ownership)" }
+  - id: worktree-meta
+    language: typescript
+    files: ["src/overlay/database.ts"]
+    query: |
+      (function_declaration name: (identifier) @n (#eq? @n "createOverlay"))
+    emit:
+      edge: { from: worktree, to: "sql:src/overlay/database.ts#layer_meta", label: "worktree_id, branch, head_commit" }
+
+  # --- Cross-database links (overlay -> base), checked in code ----------------------------------
+  - id: hides-base-files
+    language: typescript
+    files: ["src/overlay/database.ts"]
+    query: |
+      ((template_string) @s (#match? @s "CREATE TEMP VIEW hidden_files"))
+    emit:
+      edge:
+        from: "sql:src/overlay/database.ts#overlay_files"
+        to: "sql:src/db/schema.sql#files"
+        label: "path / old_path hides base file"
+        style: dashed
+  - id: hides-base-edges
+    language: typescript
+    files: ["src/overlay/database.ts"]
+    query: |
+      ((template_string) @s (#match? @s "CREATE TABLE overlay_hidden_base_edges"))
+    emit:
+      edge:
+        from: "sql:src/overlay/database.ts#overlay_hidden_base_edges"
+        to: "sql:src/db/schema.sql#edges"
+        label: "edge_id hides a base edge (re-resolved in overlay)"
+        style: dashed
+  - id: base-commit-match
+    language: typescript
+    files: ["src/overlay/merged-resolver.ts"]
+    query: |
+      ((string (string_fragment) @s) (#match? @s "FROM main.layer_meta WHERE key = 'base_commit'"))
+    emit:
+      edge:
+        from: "sql:src/overlay/database.ts#layer_meta"
+        to: "sql:src/db/schema.sql#project_metadata"
+        label: "base_commit must match"
+        style: dashed
+
+  # Anchor nodes: same ids as the sql set's tables, so they merge and the edges above can join them.
+  - id: anchor-nodes
+    language: typescript
+    files: ["src/overlay/database.ts"]
+    query: '(function_declaration name: (identifier) @n (#eq? @n "createOverlay"))'
+    emit: { node: { id: "sql:src/db/schema.sql#nodes", label: nodes } }
+  - id: anchor-edges
+    language: typescript
+    files: ["src/overlay/database.ts"]
+    query: '(function_declaration name: (identifier) @n (#eq? @n "createOverlay"))'
+    emit: { node: { id: "sql:src/db/schema.sql#edges", label: edges } }
+  - id: anchor-files
+    language: typescript
+    files: ["src/overlay/database.ts"]
+    query: '(function_declaration name: (identifier) @n (#eq? @n "createOverlay"))'
+    emit: { node: { id: "sql:src/db/schema.sql#files", label: files } }
+  - id: anchor-unresolved-refs
+    language: typescript
+    files: ["src/overlay/database.ts"]
+    query: '(function_declaration name: (identifier) @n (#eq? @n "createOverlay"))'
+    emit: { node: { id: "sql:src/db/schema.sql#unresolved_refs", label: unresolved_refs } }
+  - id: anchor-project-metadata
+    language: typescript
+    files: ["src/overlay/database.ts"]
+    query: '(function_declaration name: (identifier) @n (#eq? @n "createOverlay"))'
+    emit: { node: { id: "sql:src/db/schema.sql#project_metadata", label: project_metadata } }
+  - id: anchor-overlay-files
+    language: typescript
+    files: ["src/overlay/database.ts"]
+    query: '(function_declaration name: (identifier) @n (#eq? @n "createOverlay"))'
+    emit: { node: { id: "sql:src/overlay/database.ts#overlay_files", label: overlay_files } }
+  - id: anchor-layer-meta
+    language: typescript
+    files: ["src/overlay/database.ts"]
+    query: '(function_declaration name: (identifier) @n (#eq? @n "createOverlay"))'
+    emit: { node: { id: "sql:src/overlay/database.ts#layer_meta", label: layer_meta } }
+  - id: anchor-overlay-hidden-base-edges
+    language: typescript
+    files: ["src/overlay/database.ts"]
+    query: '(function_declaration name: (identifier) @n (#eq? @n "createOverlay"))'
+    emit: { node: { id: "sql:src/overlay/database.ts#overlay_hidden_base_edges", label: overlay_hidden_base_edges } }
