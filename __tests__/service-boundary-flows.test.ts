@@ -186,6 +186,14 @@ export function createPlan() {
 export function postPlan() {
   return request('/v1/plans', {}, { method: 'POST' });
 }
+
+export function listPlans() {
+  return request('/v1/plans');
+}
+
+export function pickPlan(verb) {
+  return request('/v1/plans', {}, { method: verb });
+}
 `,
   'agent/reader.py': `import httpx
 
@@ -221,10 +229,13 @@ describe('Requests across a gateway', () => {
 
   it("sends a page's same-origin call through the gateway's proxy route, not straight to the backend", async () => {
     const cg = await indexProject(GATEWAY_PROJECT);
-    const client = synthesized(cg, 'http-client').filter((e) => e.from === 'createPlan' || e.from === 'postPlan');
+    const client = synthesized(cg, 'http-client').filter((e) => ['createPlan', 'postPlan', 'listPlans', 'pickPlan'].includes(e.from));
     expect(client.map((e) => `${e.from} → ${e.to} ${String(e.meta.method)}`)).toEqual([
-      // The wrapper computes its method: one hop onto the one registration serving the path.
-      'createPlan → GET /v1/plans @gateway/api.py GET|POST',
+      // The wrapper picks POST when a body is passed, GET when it is left out.
+      'createPlan → POST /v1/plans @gateway/api.py POST',
+      'listPlans → GET /v1/plans @gateway/api.py GET',
+      // A method the call computes: one hop onto the one registration serving the path.
+      'pickPlan → GET /v1/plans @gateway/api.py GET|POST',
       'postPlan → POST /v1/plans @gateway/api.py POST',
     ]);
     expect(client.every((e) => e.meta.gateway === true && e.meta.callee === 'request')).toBe(true);
@@ -241,6 +252,61 @@ describe('Requests across a gateway', () => {
     const cg = await indexProject(GATEWAY_PROJECT);
     const steps = resolveNamedSymbolFlow(cg, 'postPlan lifecycle_proxy create save').chains[0]?.steps.map((s) => s.node.name);
     expect(steps).toEqual(['postPlan', 'POST /v1/plans', 'lifecycle_proxy', 'POST /v1/plans', 'create', 'save']);
+  });
+});
+
+describe('Fetch wrappers that pick their method by a parameter', () => {
+  it('derives each call site\'s method from whether it passes the body, a literal method winning', async () => {
+    const cg = await indexProject({
+      'requirements.txt': 'fastapi\n',
+      'crud/api.py': `from fastapi import FastAPI
+app = FastAPI()
+
+@app.get("/v1/plans")
+def list_plans():
+    return []
+
+@app.post("/v1/plans")
+def create_plan():
+    return {}
+
+@app.delete("/v1/plans")
+def drop_plans():
+    return {}
+`,
+      'web/api.js': `export function send(path, body) {
+  return fetch(path, { method: !body ? 'GET' : 'POST' });
+}
+export function ask(path, data) {
+  return fetch(path, { method: data == null ? 'GET' : 'POST' });
+}
+export function call(path, payload, opts = {}) {
+  return fetch(path, { method: opts.method || (payload ? 'POST' : 'GET') });
+}
+`,
+      'web/use.js': `import { send, ask, call } from './api';
+
+export const sendGet = () => send('/v1/plans');
+export const sendPost = () => send('/v1/plans', { a: 1 });
+export const askNull = () => ask('/v1/plans', null);
+export const askPost = () => ask('/v1/plans', {});
+export const callFalse = () => call('/v1/plans', false);
+export const callPost = () => call('/v1/plans', []);
+export const callDelete = () => call('/v1/plans', {}, { method: 'DELETE' });
+export const callSpread = (...a) => call('/v1/plans', ...a);
+`,
+    });
+    // `callSpread` hides the body: no one method, and three registrations serve the path.
+    const client = synthesized(cg, 'http-client');
+    expect(client.map((e) => `${e.from} → ${e.to}`)).toEqual([
+      'askNull → GET /v1/plans @crud/api.py',
+      'askPost → POST /v1/plans @crud/api.py',
+      'callDelete → DELETE /v1/plans @crud/api.py',
+      'callFalse → GET /v1/plans @crud/api.py',
+      'callPost → POST /v1/plans @crud/api.py',
+      'sendGet → GET /v1/plans @crud/api.py',
+      'sendPost → POST /v1/plans @crud/api.py',
+    ]);
   });
 });
 
