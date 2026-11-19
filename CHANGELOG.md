@@ -64,6 +64,7 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - In Drupal, services from `*.services.yml`, plugin definitions and `#[Hook]` methods are now in the graph, and a call through `\Drupal::service('x')` reaches the method on that service's class. Thanks @mikedamoiseau and @marcelovani.
 - In Next.js, a route now links to the `proxy.ts` or `middleware.ts` that runs before it, following `config.matcher`, so impact, callers and `codegraph_explore` show which routes a change to it reaches. Thanks @RIGOandre.
 - A request between your services now connects: a page's call through its own fetch wrapper, a Python `httpx`, `requests` or `aiohttp` call to another service, and a gateway route that forwards requests on to the backend route it serves all link to the route they reach.
+- A Python service's call to another service now links even when two services serve the same path: the base URL it reads from an environment variable, a settings field or a literal host is matched to the service your `compose.yaml` points it at, and nothing links when that is ambiguous.
 - Python MCP clients now link to the server tools they call: a literal tool name passed to `call_tool`, or to your own wrapper around it, reaches the `@mcp.tool()` function registered under that name.
 - `codegraph_explore`'s Flow now continues from a route into the function that handles it, so a flow from a client call reaches the server code it runs.
 

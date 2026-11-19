@@ -255,6 +255,112 @@ describe('Requests across a gateway', () => {
   });
 });
 
+const TOPOLOGY_PROJECT: Record<string, string> = {
+  'requirements.txt': 'fastapi\nhttpx\npydantic-settings\n',
+  'compose.yaml': `services:
+  crud:
+    build:
+      context: .
+    command: ["uvicorn", "crud.server:app", "--port", "8001"]
+  shadow:
+    build: ./shadow
+  agent:
+    build: ./agent
+    environment:
+      CRUD_URL: http://crud:8001
+      SHADOW_URL: "http://shadow:9000"
+      BOTH_URL: http://crud:8001
+      LOCAL_URL: http://localhost:8001
+  worker:
+    build: ./agent
+    environment:
+      - BOTH_URL=http://shadow:9000
+`,
+  'crud/server.py': 'from .api import app\n',
+  'crud/api.py': 'from fastapi import FastAPI\napp = FastAPI()\n\n@app.get("/v1/profile")\ndef crud_profile():\n    return {}\n',
+  'shadow/api.py': 'from fastapi import FastAPI\napp = FastAPI()\n\n@app.get("/v1/profile")\ndef shadow_profile():\n    return {}\n',
+  'agent/settings.py': `from pydantic_settings import BaseSettings
+
+class Settings(BaseSettings):
+    shadow_url: str = "http://localhost:9000"
+
+settings = Settings()
+`,
+  'agent/clients.py': `import os
+import httpx
+from .settings import settings
+
+class Reader:
+    def __init__(self, base_url: str) -> None:
+        self.base_url = base_url.rstrip("/")
+
+    async def profile(self):
+        async with httpx.AsyncClient(timeout=10) as client:
+            return await client.get(f"{self.base_url}/v1/profile")
+
+class Mixed:
+    def __init__(self, base_url):
+        self.base_url = base_url
+
+    def profile(self):
+        return httpx.get(f"{self.base_url}/v1/profile")
+
+def from_env():
+    return httpx.get(f"{os.environ['SHADOW_URL']}/v1/profile")
+
+def from_settings():
+    with httpx.Client(base_url=settings.shadow_url) as client:
+        return client.get("/v1/profile")
+
+def from_host():
+    return httpx.get("http://crud:8001/v1/profile")
+
+def two_services():
+    return httpx.get(f"{os.getenv('BOTH_URL')}/v1/profile")
+
+def not_a_service():
+    return httpx.get(f"{os.getenv('LOCAL_URL')}/v1/profile")
+
+def unset():
+    return httpx.get(f"{os.getenv('NOT_IN_COMPOSE')}/v1/profile")
+`,
+  'agent/app.py': `import os
+from .clients import Mixed, Reader
+
+def create_app():
+    base_url = os.getenv("CRUD_URL")
+    reader = Reader(base_url)
+    return reader, Mixed(os.environ["CRUD_URL"]), Mixed(base_url=os.environ["SHADOW_URL"])
+`,
+};
+
+describe('Calls bound by compose topology', () => {
+  it('binds a base URL read from a compose environment variable to the routes of the service its URL names', async () => {
+    const cg = await indexProject(TOPOLOGY_PROJECT);
+    const edges = synthesized(cg, 'http-client');
+    expect(edges.map((e) => `${e.from} → ${e.to} [${String(e.meta.topology)}]`)).toEqual([
+      'from_env → GET /v1/profile @shadow/api.py [SHADOW_URL → shadow]',
+      'from_host → GET /v1/profile @crud/api.py [crud → crud]',
+      'from_settings → GET /v1/profile @shadow/api.py [SHADOW_URL → shadow]',
+      // Through the constructor parameter to the one place the class is built, reading CRUD_URL.
+      'Reader::profile → GET /v1/profile @crud/api.py [CRUD_URL → crud]',
+    ]);
+    expect(edges[3]!.meta).toMatchObject({ channel: 'http', tier: 'server→server', method: 'GET', registeredAt: 'crud/api.py:4' });
+  });
+
+  it('stays silent when the variable names two services, a host outside compose, nothing, or constructions disagree', async () => {
+    const cg = await indexProject(TOPOLOGY_PROJECT);
+    const from = new Set(synthesized(cg, 'http-client').map((e) => e.from));
+    for (const silent of ['two_services', 'not_a_service', 'unset', 'Mixed::profile']) expect(from.has(silent)).toBe(false);
+  });
+
+  it('leaves the tie alone without a compose file', async () => {
+    const { ['compose.yaml']: _compose, ...noCompose } = TOPOLOGY_PROJECT;
+    const cg = await indexProject(noCompose);
+    expect(synthesized(cg, 'http-client')).toEqual([]);
+  });
+});
+
 describe('Fetch wrappers that pick their method by a parameter', () => {
   it('derives each call site\'s method from whether it passes the body, a literal method winning', async () => {
     const cg = await indexProject({
