@@ -187,6 +187,7 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 #### JavaScript and TypeScript, with React, Vue, Svelte, Angular, Next.js and more
 
+- A call through your own fetch wrapper that picks GET or POST by whether a body is passed now links to the route with the method that call actually makes, so a create call reaches the POST route instead of the GET one.
 - In TypeScript, an awaited call with type arguments, like `await api.get<T>(url)`, now links to the function it calls, so typed fetch wrappers no longer look like they have no callers. (#2586)
 - In JavaScript and TypeScript, a call or `new` in a parameter's default value, like `function renderWithNote(note = buildNote())`, now counts as the function's own call. Thanks @inth3shadows. (#2588)
 - In React, a component rendered at module scope or in a test's `it(…)` callback, like `createRoot(el).render(<App />)`, now counts as rendered there, so an app's entry reaches its root component and tests show as callers. (#2587)

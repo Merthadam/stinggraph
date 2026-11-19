@@ -172,6 +172,63 @@ function methodIn(text: string): string | null {
   return m ? m[2]!.toUpperCase() : null;
 }
 
+/**
+ * A wrapper's method chosen by whether a parameter was passed:
+ * `method: options.method || (body === undefined ? 'GET' : 'POST')`.
+ */
+interface MethodBy {
+  /** The parameter's position in the wrapper's signature. */
+  param: number;
+  /** What counts as not passing it: `=== undefined`, `=== null`, `== null`, or `!x` / `x ?`. */
+  test: 'undefined' | 'null' | 'nullish' | 'falsy';
+  absent: string;
+  present: string;
+}
+
+/** The `x === undefined ? 'GET' : 'POST'` a computed `method:` value picks by, against the wrapper's parameters. */
+function methodByIn(options: string, params: string[]): MethodBy | null {
+  const at = /\bmethod\s*:([^,]*)/.exec(options);
+  if (!at) return null;
+  const value = at[1]!;
+  const verb = String.raw`\s*\?\s*['"]([A-Za-z]+)['"]\s*:\s*['"]([A-Za-z]+)['"]`;
+  const compare = new RegExp(String.raw`(?<![\w$.])([A-Za-z_$][\w$]*)\s*(===?|!==?)\s*(undefined|null)` + verb).exec(value);
+  const truthy = compare ? null : new RegExp(String.raw`(!?)\s*(?<![\w$.])([A-Za-z_$][\w$]*)` + verb).exec(value);
+  const name = compare ? compare[1]! : truthy?.[2];
+  const param = name === undefined ? -1 : params.indexOf(name);
+  if (param < 1) return null;
+  if (compare) {
+    const strict = compare[2]!.length === 3;
+    const test = !strict ? 'nullish' : compare[3] === 'null' ? 'null' : 'undefined';
+    const [whenTrue, whenFalse] = [compare[4]!.toUpperCase(), compare[5]!.toUpperCase()];
+    const negated = compare[2]!.startsWith('!');
+    return { param, test, absent: negated ? whenFalse : whenTrue, present: negated ? whenTrue : whenFalse };
+  }
+  const [whenTrue, whenFalse] = [truthy![3]!.toUpperCase(), truthy![4]!.toUpperCase()];
+  const negated = truthy![1] === '!';
+  return { param, test: 'falsy', absent: negated ? whenTrue : whenFalse, present: negated ? whenFalse : whenTrue };
+}
+
+/** The method a wrapper call makes by the argument at `by.param`; null when a spread hides it. */
+function methodByArgs(by: MethodBy, args: string[]): string | null {
+  if (args.slice(0, by.param + 1).some((a) => a.trim().startsWith('...'))) return null;
+  const arg = args[by.param]?.trim();
+  if (arg === undefined || arg === '') return by.test === 'null' ? by.present : by.absent;
+  const absent =
+    by.test === 'null' ? ['null']
+    : by.test === 'undefined' ? ['undefined', 'void 0']
+    : by.test === 'nullish' ? ['undefined', 'void 0', 'null']
+    : ['undefined', 'void 0', 'null', 'false', '0', "''", '""', '``'];
+  return absent.includes(arg) ? by.absent : by.present;
+}
+
+/** A function's parameter names, in order, from its signature; `''` for a destructured one. */
+function paramNames(fn: Node): string[] {
+  const sig = fn.signature ?? '';
+  const open = sig.indexOf('(');
+  if (open < 0) return firstParam(fn) ? [firstParam(fn)!] : [];
+  return (argumentsAt(sig, open) ?? []).map((p) => /^\s*([A-Za-z_$][\w$]*)/.exec(p)?.[1] ?? '');
+}
+
 /** The first string literal anywhere in a decorator's arguments (`'x'`, `{ name: 'x' }`). */
 function firstLiteral(args: string): string | null {
   const m = /(['"`])([^'"`]+)\1/.exec(args);
@@ -263,9 +320,10 @@ interface FileFacts {
   /**
    * This file's functions that hand their first parameter to a client call as
    * the URL — `function request(path) { return fetch(path, …) }` — with the
-   * method that call makes (null when computed). Filled by the HTTP scan.
+   * method that call makes (null when computed), and the parameter a computed
+   * method is chosen by when there is one. Filled by the HTTP scan.
    */
-  wrappers: Map<string, { method: string | null; baseURL: string | null }>;
+  wrappers: Map<string, { method: string | null; methodBy: MethodBy | null; baseURL: string | null }>;
   /** The module's default export is a client instance. */
   defaultClient: { baseURL: string | null } | null;
   /** Local names bound to a named queue (`new Queue('email')`, `@InjectQueue('email') x`). */
@@ -574,6 +632,7 @@ function collectHttpSites(ctx: ResolutionContext, facts: FileFacts, sites: HttpS
     let first = args[0];
     let method = verb;
     let computedMethod = false;
+    let options = '';
     // `axios({ url, method })`, `.request({ url, method })`, `ky(url, { method })`.
     if (first.trimStart().startsWith('{')) {
       const url = /\burl\s*:\s*/.exec(first);
@@ -581,7 +640,7 @@ function collectHttpSites(ctx: ResolutionContext, facts: FileFacts, sites: HttpS
       method = method ?? methodIn(first) ?? 'GET';
       first = first.slice(url.index + url[0].length);
     } else if (method === null) {
-      const options = args.slice(1).join(',');
+      options = args.slice(1).join(',');
       method = methodIn(options);
       computedMethod = method === null && /\bmethod\s*:/.test(options);
       method = method ?? 'GET';
@@ -590,7 +649,8 @@ function collectHttpSites(ctx: ResolutionContext, facts: FileFacts, sites: HttpS
     if (literal === null) {
       // `function request(path) { … fetch(path, …) }`: its callers write the path.
       if (fn.kind === 'function' && first.trim() === firstParam(fn)) {
-        facts.wrappers.set(fn.name, { method: computedMethod ? null : method, baseURL });
+        const methodBy = computedMethod ? methodByIn(options, paramNames(fn)) : null;
+        facts.wrappers.set(fn.name, { method: computedMethod ? null : method, methodBy, baseURL });
       }
       return;
     }
@@ -645,7 +705,9 @@ function collectWrapperSites(ctx: ResolutionContext, facts: FileFacts, names: Re
     const path = clientPath(literal, wrapper.baseURL);
     if (!path) continue;
     const browser = wrapper.baseURL === null && !path.suffix && !ABSOLUTE_URL.test(literal);
-    const method = methodIn(args.slice(1).join(',')) ?? wrapper.method;
+    // A literal `method:` in the call wins; a computed one leaves the wrapper's own pick.
+    const rest = args.slice(1).join(',');
+    const method = methodIn(rest) ?? (wrapper.methodBy && !/\bmethod\s*:/.test(rest) ? methodByArgs(wrapper.methodBy, args) : wrapper.method);
     sites.push({ fn, file: facts.file, line, column: facts.columnOf(m.index), callee: name, method, browser, segs: path.segs, suffix: path.suffix, display: path.display });
   }
 }
