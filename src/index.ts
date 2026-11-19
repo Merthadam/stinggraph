@@ -48,6 +48,7 @@ import { engine } from './lazy-engine';
 import { GraphTraverser, GraphQueryManager } from './graph';
 import type { CallSiteRow } from './graph';
 import { findNamedCopybooks, type NamedCopybook } from './graph/cobol-copybooks';
+import { assignLayers, computeLayerRollup, computeLayers, ROLLUP_EDGE_KINDS, type LayerGraphSource, type LayerLevel, type LayerRollup, type Layers } from './graph/layers';
 import { ContextBuilder, createContextBuilder } from './context';
 import { Mutex, FileLock, escapesRoot } from './utils';
 import type { FileWatcher, WatchOptions, PendingFile } from './sync';
@@ -3177,6 +3178,35 @@ export class CodeGraph {
   }
 
   /**
+   * Service layers: every indexed file's L1 service and L2 module, inferred
+   * from manifests and compose run config and refined by a committed
+   * `.stinggraph/layers.yaml`, with each service's entry points and any config
+   * errors. A query, never stored. See `src/graph/layers.ts`.
+   */
+  getLayers(): Layers {
+    return computeLayers(this.projectRoot, this.layerSource());
+  }
+
+  /**
+   * Edges between services (or `service/module` units at `level: 'module'`),
+   * counted per kind. Pass the result of {@link getLayers} to reuse it.
+   */
+  getLayerRollup(options: { level?: LayerLevel; excludeTests?: boolean; layers?: Layers } = {}): LayerRollup {
+    const layers = options.layers ?? assignLayers(this.projectRoot, this.queries.getAllFilePaths(), this.queries.getFileImportPairs());
+    return computeLayerRollup(layers, this.queries.getFileEdgeCounts(ROLLUP_EDGE_KINDS), options);
+  }
+
+  private layerSource(): LayerGraphSource {
+    return {
+      files: () => this.queries.getAllFilePaths(),
+      importPairs: () => this.queries.getFileImportPairs(),
+      fileEdgeCounts: () => this.queries.getFileEdgeCounts(ROLLUP_EDGE_KINDS),
+      routes: () => this.queries.getNodesByKind('route'),
+      nodesInFiles: (paths) => this.queries.getNodesByFiles(paths),
+    };
+  }
+
+  /**
    * Find unreferenced symbols — the RAW candidate set.
    *
    * Non-exported symbols of the given kinds with no incoming edge but
@@ -3325,3 +3355,10 @@ export default CodeGraph;
 
 // Shared-base / worktree overlay spike; extraction stays behind engine().
 export * from './overlay';
+export {
+  assignLayers, computeLayerRollup, computeLayers, overlayLayerSource, parseYamlSubset, LAYERS_CONFIG_PATH, UNASSIGNED,
+} from './graph/layers';
+export type {
+  ComposeRun, FileEdgeCount, LayerAssignment, LayerConfigError, LayerEntryPoint, LayerGraphSource, LayerLevel, LayerModule,
+  LayerNode, LayerRollup, LayerRollupEdge, Layers, LayerService,
+} from './graph/layers';

@@ -1,6 +1,8 @@
 # Service layers: named levels above the file
 
-Status: **design draft — not implemented.** Nothing here ships until the eval below passes.
+Status: **config-only layers implemented** (per the spike's recommendation): `src/graph/layers.ts`,
+`CodeGraph.getLayers` / `getLayerRollup`, `codegraph layers`. Nothing is stored and `codegraph_explore`
+is untouched; the storage and explore-scoping sections below remain design only.
 
 ## Problem
 
