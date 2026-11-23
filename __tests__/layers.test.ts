@@ -96,7 +96,7 @@ describe('layers', () => {
     expect(layers.config).toBeNull();
     expect(layers.errors).toEqual([]);
     expect(layers.services.map((s) => [s.id, s.files])).toEqual([
-      ['frontend', 3], ['auth', 1], ['crud', 2], ['mcps', 4], [UNASSIGNED, 3],
+      ['frontend', 3], ['auth', 1], ['crud', 2], ['mcps', 4], ['services', 1], ['shared', 1], [UNASSIGNED, 1],
     ]);
     expect(layers.services.find((s) => s.id === 'auth')!.evidence).toEqual(['compose:auth (Dockerfile.auth CMD)']);
     expect(layers.services.find((s) => s.id === 'frontend')!.evidence).toEqual(['manifest (package.json)']);
@@ -107,7 +107,51 @@ describe('layers', () => {
     expect(layers.assignments['services/mcps/research_server.py']).toEqual({ service: 'mcps', module: 'research-mcp' });
     expect(layers.assignments['services/mcps/common.py']).toEqual({ service: 'mcps', module: '(root)' });
     expect(layers.assignments['frontend/src/features/plans/Page.tsx']).toEqual({ service: 'frontend', module: 'features' });
-    for (const f of ['services/shared/util.py', 'services/loose.py', 'scripts/seed.py']) expect(of(f)).toBe(UNASSIGNED);
+    // What no manifest or compose service covers falls back to folders; scripts stay unassigned.
+    expect(layers.assignments['services/shared/util.py']).toEqual({ service: 'shared', module: '(root)' });
+    expect(layers.assignments['services/loose.py']).toEqual({ service: 'services', module: '(root)' });
+    expect(layers.services.find((s) => s.id === 'shared')).toMatchObject({ origin: 'inferred', roots: ['services/shared/'] });
+    expect(of('scripts/seed.py')).toBe(UNASSIGNED);
+  });
+
+  it('falls back to folders in a single-package repo: top-level folders are services, support files stay unassigned', () => {
+    const files = [
+      'electron/main.ts', 'electron/views/engine.ts', 'electron/views/rules/layers.ts',
+      'src/App.tsx', 'src/views-ui/Graph.tsx', 'src/infra/catalog.ts',
+      'tests/views.test.ts', 'scripts/release.mjs', 'docs/notes.ts', 'src/App.test.tsx', 'vite.config.ts', '.github/workflows/ci.yml',
+    ];
+    for (const f of files) write(f, '');
+    write('package.json', '{"name":"app"}');
+    const layers = assignLayers(dir, files, []);
+    expect(layers.errors).toEqual([]);
+    expect(layers.services.map((s) => [s.id, s.files])).toEqual([['electron', 3], ['src', 3], [UNASSIGNED, 6]]);
+    expect(layers.services[0]!.evidence).toEqual(['folder fallback: no manifest or compose service covers it']);
+    expect(layers.assignments['electron/views/rules/layers.ts']).toEqual({ service: 'electron', module: 'views' });
+    expect(layers.assignments['electron/main.ts']).toEqual({ service: 'electron', module: '(root)' });
+    expect(layers.assignments['src/views-ui/Graph.tsx']).toEqual({ service: 'src', module: 'views-ui' });
+    for (const f of ['tests/views.test.ts', 'scripts/release.mjs', 'docs/notes.ts', 'src/App.test.tsx', 'vite.config.ts', '.github/workflows/ci.yml']) {
+      expect(layers.assignments[f]!.service).toBe(UNASSIGNED);
+    }
+  });
+
+  it('the folder fallback steps through a lone wrapper folder and names loose files after their folder', () => {
+    const files = ['src/main.ts', 'src/features/plans/Page.tsx', 'src/features/auth/Login.tsx', 'src/lib/http.ts', 'index.ts'];
+    for (const f of files) write(f, '');
+    const layers = assignLayers(dir, files, []);
+    expect(layers.services.map((s) => [s.id, s.roots, s.files])).toEqual([
+      ['src', ['src/'], 1], ['features', ['src/features/'], 2], ['lib', ['src/lib/'], 1], [UNASSIGNED, [], 1],
+    ]);
+    expect(layers.assignments['src/features/plans/Page.tsx']).toEqual({ service: 'features', module: 'plans' });
+    expect(layers.services[0]!.evidence).toEqual(['folder fallback: files loose in this folder']);
+  });
+
+  it('a folder service whose name is taken keeps its path as id', () => {
+    const files = ['apps/api/server.ts', 'libs/api/client.ts'];
+    for (const f of files) write(f, '');
+    write('apps/api/package.json', '{"name":"api"}');
+    const layers = assignLayers(dir, files, []);
+    // `libs/` alone is left, so the fallback steps into it; its `api` collides with the manifest's.
+    expect(layers.services.map((s) => [s.id, s.label])).toEqual([['api', 'api'], ['libs/api', 'libs/api']]);
   });
 
   it('a declared layers.yaml refines inference: labels, excludes, glob and compose modules', () => {
@@ -174,7 +218,7 @@ describe('layers', () => {
     write('compose.yaml', 'x-common: &common\n  image: a\nservices:\n  web:\n    <<: *common\n');
     const layers = assignLayers(dir, files, imports);
     expect(layers.errors).toEqual([{ source: 'compose.yaml', message: expect.stringMatching(/could not read compose services: line 1: anchors/) }]);
-    expect(layers.services.map((s) => s.id)).toEqual(['frontend', UNASSIGNED]);
+    expect(layers.services.map((s) => s.id)).toEqual(['frontend', 'services', 'auth', 'crud', 'mcps', 'shared', UNASSIGNED]);
   });
 
   describe('over a real index', () => {

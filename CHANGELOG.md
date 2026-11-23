@@ -31,7 +31,7 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### New Features
 
-- New `codegraph layers` command groups a repo's files into services and modules — found from workspace packages, manifests and the commands in `compose.yaml`, or named in a committed `.stinggraph/layers.yaml` — and counts the calls, imports and references between them, as text or `--json`; a file two services claim is reported, not guessed.
+- New `codegraph layers` command groups a repo's files into services and modules — found from workspace packages, manifests and the commands in `compose.yaml`, else from top-level folders (tests, scripts and docs left out), or named in a committed `.stinggraph/layers.yaml` — and counts the calls, imports and references between them, as text or `--json`; a file two services claim is reported, not guessed.
 - `codegraph files --format package` and `codegraph_files` with `format: "package"` now group files by their nearest `package.json` or `composer.json`, so a monorepo splits into its workspaces. Thanks @LuisAlbertoMK. (#1871)
 - In C#, MediatR `Send` and `Publish` now reach handlers written against the project's own interfaces, like `ICommandHandler<T>`, or a package's, like the Mediator library's, with no setup. Thanks @PressXtoChris.
 - `codegraph files --json` now marks test files, `--tests` and `--no-tests` filter the list, and `codegraph node --file` says "test file" in its header. Thanks @maxmilian. (#1877)
