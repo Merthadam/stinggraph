@@ -12,6 +12,10 @@
  *     they build). Compose services sharing one folder become its modules.
  *  2. Declared: `.stinggraph/layers.yaml`. A declared service replaces every
  *     inferred service its `include:` reaches, so its `exclude:` is final.
+ * Without a usable `layers.yaml`, files no manifest or compose service covers
+ * (all of them in a single-package repo, whose root manifest is L0, not a
+ * service) fall back to folders: see {@link folderServices}. Tests, scripts,
+ * docs and files directly in the repo root stay `(unassigned)`.
  * A file two declared services (or two modules) match is a reported config
  * error and is left `(unassigned)` at that level, never resolved silently.
  */
@@ -537,6 +541,42 @@ function folderModule(srcRoot: string, file: string): string {
   return parts.length > 1 && !rel.startsWith('..') ? parts[0]! : '(root)';
 }
 
+/** Folders whose files are not product code (as are dot-folders such as `.github`): the folder fallback leaves them `(unassigned)`. */
+const SUPPORT_DIRS = new Set(['test', 'tests', '__tests__', 'spec', 'specs', 'e2e', 'fixtures', '__fixtures__', '__mocks__',
+  'scripts', 'script', 'docs', 'doc', 'examples', 'example', 'samples', 'benchmarks', 'bench']);
+const isSupportFile = (f: string) => isTestFile(f) || f.split('/').slice(0, -1).some((d) => d.startsWith('.') || SUPPORT_DIRS.has(d.toLowerCase()));
+
+interface FolderService { id: string; dir: string; loose: boolean; files: string[] }
+
+/**
+ * The folder fallback: files no inferred service covers, grouped into one
+ * service per folder. It starts at the repo root and steps down while the
+ * files sit in a single folder with nothing loose beside it (`src/` alone →
+ * its subfolders), then makes each subfolder a service; files loose at that
+ * level (below the root) form a service named after their folder. Support
+ * files and files directly in the root are left out.
+ */
+function folderServices(files: string[]): FolderService[] {
+  const candidates = files.filter((f) => f.includes('/') && !isSupportFile(f));
+  let prefix = '';
+  for (;;) {
+    const below = candidates.filter((f) => f.startsWith(prefix));
+    const folders = new Set(below.filter((f) => f.slice(prefix.length).includes('/')).map((f) => f.slice(prefix.length).split('/')[0]!));
+    const loose = below.some((f) => !f.slice(prefix.length).includes('/'));
+    if (folders.size !== 1 || loose) break;
+    prefix += [...folders][0]! + '/';
+  }
+  const out = new Map<string, FolderService>();
+  for (const f of candidates.filter((c) => c.startsWith(prefix))) {
+    const rest = f.slice(prefix.length);
+    const loose = !rest.includes('/');
+    const dir = loose ? prefix.slice(0, -1) : prefix + rest.split('/')[0]!;
+    if (!out.has(dir)) out.set(dir, { id: path.posix.basename(dir), dir, loose, files: [] });
+    out.get(dir)!.files.push(f);
+  }
+  return [...out.values()].sort((a, b) => a.dir.localeCompare(b.dir));
+}
+
 const globMatcher = (globs: string[]) => (globs.length ? picomatch(globs, { dot: true }) : () => false);
 
 /** Every file's service and module, the services with their counts, and what went wrong. Entry points are left empty; see {@link computeLayers}. */
@@ -613,6 +653,15 @@ export function assignLayers(root: string, indexedFiles: string[], importPairs: 
       : unassigned;
   }
 
+  // The folder fallback, for what neither a declared nor an inferred service took.
+  const fallback = declared ? [] : folderServices(files.filter((f) => assignments[f] === unassigned));
+  const taken = new Set([...compiled.map((c) => c.s.id), ...kept.map((i) => i.id)]);
+  for (const s of fallback) if (taken.has(s.id) || fallback.some((o) => o !== s && o.id === s.id)) s.id = s.dir;
+  for (const s of fallback) {
+    const src = sourceRoot(root, [s.dir + '/**']);
+    for (const f of s.files) assignments[f] = { service: s.id, module: s.loose ? '(root)' : folderModule(src, f) };
+  }
+
   const counts = (service: string) => {
     const modules = new Map<string, number>();
     let n = 0;
@@ -633,6 +682,11 @@ export function assignLayers(root: string, indexedFiles: string[], importPairs: 
   for (const i of kept) {
     const { n, modules } = counts(i.id);
     services.push({ id: i.id, label: i.id, aliases: [], origin: 'inferred', roots: [i.dir + '/'], evidence: i.evidence, files: n, modules: modulesOf([], modules), entryPoints: [] });
+  }
+  for (const s of fallback) {
+    const { n, modules } = counts(s.id);
+    const evidence = [s.loose ? 'folder fallback: files loose in this folder' : 'folder fallback: no manifest or compose service covers it'];
+    services.push({ id: s.id, label: s.id, aliases: [], origin: 'inferred', roots: [s.dir + '/'], evidence, files: n, modules: modulesOf([], modules), entryPoints: [] });
   }
   const loose = counts(UNASSIGNED);
   if (loose.n) services.push({ id: UNASSIGNED, label: UNASSIGNED, aliases: [], origin: 'unassigned', roots: [], evidence: [], files: loose.n, modules: [], entryPoints: [] });

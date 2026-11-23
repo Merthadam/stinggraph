@@ -39,6 +39,13 @@ Deterministic, in this order; a later source refines an earlier one, never contr
    `compose.yaml` services — resolved through their `command` / entrypoint module path, not their
    Dockerfile, since one image is often shared (travella builds every Python service from
    `Dockerfile.auth`). Inferred names are the folder or compose name (`crud`, `mcps`).
+   **Folder fallback.** Without a usable `layers.yaml`, files no inferred service covers — all of
+   them in a single-package repo, since the root manifest is L0, not a service — are grouped by
+   folder: starting at the repo root and stepping down while everything sits in one folder with
+   nothing loose beside it (a lone `src/`), each subfolder becomes a service (evidence `folder
+   fallback: …`), and files loose at that level (below the root) one named after their folder.
+   Tests, `scripts/`, `docs/`, examples, fixtures, dot-folders and files directly in the root stay
+   `(unassigned)`. A folder whose name another service has keeps its path as id.
 2. **Declared.** `.stinggraph/layers.yaml` (committed; `.codegraph/` is gitignored as a whole, so config can't live there) gives human names, aliases, merges and
    module splits. This is where "CRUD backend" comes from — the code never says it.
 
